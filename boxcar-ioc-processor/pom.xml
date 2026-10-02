@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.boxcar</groupId>
+        <artifactId>boxcar-ioc</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>boxcar-ioc-processor</artifactId>
+
+    <name>Boxcar IoC :: Processor</name>
+    <description>
+        Annotation processor that generates com.boxcar.Injector for the beans of a compilation.
+    </description>
+
+    <!--
+        The processor itself has no compile-time dependencies: annotations are matched by their fully
+        qualified names, so users only need the Jakarta API jars their own code already depends on.
+        Everything below is test scope.
+    -->
+    <dependencies>
+        <!-- Fixture beans and the shared TCK; the injector for the fixtures is generated at test compile time. -->
+        <dependency>
+            <groupId>com.boxcar</groupId>
+            <artifactId>boxcar-ioc-tck</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <executions>
+                    <!-- The processor cannot process its own compilation: its service file is already in
+                         target/classes but the class is not compiled yet, so disable processing here. -->
+                    <execution>
+                        <id>default-compile</id>
+                        <configuration>
+                            <proc>none</proc>
+                        </configuration>
+                    </execution>
+                    <!-- Test compilation discovers the processor from target/classes (on the class path) via
+                         META-INF/services. The beans live in the TCK jar, so the processor is pointed at their
+                         package prefix, exactly as a test-scoped setup in a real project would be. -->
+                    <execution>
+                        <id>default-testCompile</id>
+                        <configuration>
+                            <proc>full</proc>
+                            <compilerArgs>
+                                <arg>-Aboxcar.packages=com.boxcar.ioc.fixtures</arg>
+                            </compilerArgs>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>
