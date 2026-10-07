@@ -38,11 +38,11 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Enumeration;
+import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.function.Consumer;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
@@ -60,13 +60,14 @@ import java.util.zip.ZipFile;
 final class ClassPathScanner {
 
     private final List<Path> roots = new ArrayList<>();
+    private final List<String> warnings = new ArrayList<>();
 
-    ClassPathScanner(ClassLoader loader, Collection<Path> explicitRoots, Consumer<String> warnings) {
+    ClassPathScanner(ClassLoader loader, Collection<Path> explicitRoots) {
         for (Path root : explicitRoots) {
             if (Files.exists(root)) {
                 roots.add(root);
             } else {
-                warnings.accept("Class path entry " + root + " does not exist");
+                warnings.add("Class path entry " + root + " does not exist");
             }
         }
         roots.addAll(rootsOf(loader));
@@ -75,6 +76,11 @@ final class ClassPathScanner {
     /** The roots being scanned, for diagnostics. */
     List<Path> roots() {
         return List.copyOf(roots);
+    }
+
+    /** Problems found with the explicit roots while constructing the scanner, for the caller to report. */
+    List<String> warnings() {
+        return List.copyOf(warnings);
     }
 
     /**
@@ -115,9 +121,14 @@ final class ClassPathScanner {
             return;
         }
         try (Stream<Path> files = Files.walk(start)) {
-            files.filter(Files::isRegularFile)
-                    .map(file -> root.relativize(file).toString().replace(File.separatorChar, '/'))
-                    .forEach(relative -> addClass(relative, names));
+            Iterator<Path> iterator = files.iterator();
+            while (iterator.hasNext()) {
+                Path file = iterator.next();
+                if (Files.isRegularFile(file)) {
+                    String relative = root.relativize(file).toString().replace(File.separatorChar, '/');
+                    addClass(relative, names);
+                }
+            }
         } catch (IOException e) {
             throw new UncheckedIOException("Cannot scan " + start, e);
         }
@@ -172,7 +183,10 @@ final class ClassPathScanner {
                 current = current.getParent()) {
             if (current instanceof URLClassLoader urlLoader) {
                 for (URL url : urlLoader.getURLs()) {
-                    toPath(url).ifPresent(roots::add);
+                    Path path = toPath(url);
+                    if (path != null) {
+                        roots.add(path);
+                    }
                 }
             } else if (current == ClassLoader.getSystemClassLoader()) {
                 // The application class loader is not a URLClassLoader since Java 9; its class path is the system
@@ -185,18 +199,24 @@ final class ClassPathScanner {
                 }
             }
         }
-        roots.removeIf(root -> !Files.exists(root));
-        return new ArrayList<>(roots);
+        List<Path> existing = new ArrayList<>();
+        for (Path root : roots) {
+            if (Files.exists(root)) {
+                existing.add(root);
+            }
+        }
+        return existing;
     }
 
-    private static java.util.Optional<Path> toPath(URL url) {
+    /** The local path a {@code file:} URL points at, or {@code null} for any other URL. */
+    private static Path toPath(URL url) {
         if (!url.getProtocol().equals("file")) {
-            return java.util.Optional.empty();
+            return null;
         }
         try {
-            return java.util.Optional.of(Paths.get(url.toURI()));
+            return Paths.get(url.toURI());
         } catch (URISyntaxException | IllegalArgumentException e) {
-            return java.util.Optional.empty();
+            return null;
         }
     }
 }

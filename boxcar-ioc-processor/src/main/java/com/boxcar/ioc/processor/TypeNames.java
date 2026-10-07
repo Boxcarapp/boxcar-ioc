@@ -27,7 +27,6 @@ package com.boxcar.ioc.processor;
  */
 
 import java.util.List;
-import java.util.stream.Collectors;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.Modifier;
@@ -47,9 +46,10 @@ import javax.lang.model.util.Types;
  * Renders {@link TypeMirror}s as Java source and decides whether a type can be named from the
  * generated {@code com.boxcar} package at all.
  *
- * <p>Everything is rendered fully qualified: the generated class imports nothing, so no user type
- * can ever clash with a JDK type the injector itself uses. {@link TypeMirror#toString()} is
- * deliberately avoided because javac includes type-use annotations in it.
+ * <p>Top-level class names are rendered as {@linkplain Imports markers} that {@link Imports} later
+ * turns into either a simple name backed by an import or, where two types share a simple name, the
+ * qualified name. {@link TypeMirror#toString()} is deliberately avoided because javac includes
+ * type-use annotations in it.
  */
 final class TypeNames {
 
@@ -61,18 +61,24 @@ final class TypeNames {
         this.elements = elements;
     }
 
-    /** Fully qualified source representation of {@code type}, including type arguments. */
+    /** Source representation of {@code type}, including type arguments, with class names as import markers. */
     String render(TypeMirror type) {
         return type.accept(new SimpleTypeVisitor14<String, Void>() {
             @Override
             public String visitDeclared(DeclaredType t, Void unused) {
-                String name = ((TypeElement) t.asElement()).getQualifiedName().toString();
+                String name = Imports.reference((TypeElement) t.asElement());
                 List<? extends TypeMirror> args = t.getTypeArguments();
                 if (args.isEmpty()) {
                     return name;
                 }
-                return name + args.stream().map(TypeNames.this::render)
-                        .collect(Collectors.joining(", ", "<", ">"));
+                StringBuilder rendered = new StringBuilder(name).append('<');
+                for (int i = 0; i < args.size(); i++) {
+                    if (i > 0) {
+                        rendered.append(", ");
+                    }
+                    rendered.append(render(args.get(i)));
+                }
+                return rendered.append('>').toString();
             }
 
             @Override
@@ -104,9 +110,14 @@ final class TypeNames {
         }, null);
     }
 
-    /** Source rendering of the erasure of {@code type}, e.g. {@code java.util.List} for {@code List<Foo>}. */
+    /** Source rendering of the erasure of {@code type}, e.g. {@code List} for {@code List<Foo>}. */
     String renderErasure(TypeMirror type) {
         return render(types.erasure(type));
+    }
+
+    /** Fully qualified rendering of {@code type} for comments and messages, without import markers. */
+    String describe(TypeMirror type) {
+        return Imports.plain(render(type));
     }
 
     /**
@@ -117,8 +128,15 @@ final class TypeNames {
         return type.accept(new SimpleTypeVisitor14<Boolean, Void>() {
             @Override
             public Boolean visitDeclared(DeclaredType t, Void unused) {
-                return isPublicType((TypeElement) t.asElement())
-                        && t.getTypeArguments().stream().allMatch(TypeNames.this::isAccessible);
+                if (!isPublicType((TypeElement) t.asElement())) {
+                    return false;
+                }
+                for (TypeMirror argument : t.getTypeArguments()) {
+                    if (!isAccessible(argument)) {
+                        return false;
+                    }
+                }
+                return true;
             }
 
             @Override

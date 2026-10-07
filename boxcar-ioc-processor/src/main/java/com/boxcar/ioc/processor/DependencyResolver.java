@@ -29,12 +29,13 @@ package com.boxcar.ioc.processor;
 import com.boxcar.ioc.processor.BeanModel.Dependency;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.type.DeclaredType;
 import javax.lang.model.type.TypeKind;
@@ -76,15 +77,18 @@ final class DependencyResolver {
 
     private void resolve(Dependency dependency) {
         TypeMirror requested = dependency.requestedType;
-        String rendered = names.render(requested);
+        String rendered = simpleNames(names.describe(requested));
         if (TypeNames.isTypeVariableOrWildcard(requested) || requested.getKind().isPrimitive()
                 || requested.getKind() != TypeKind.DECLARED && requested.getKind() != TypeKind.ARRAY) {
             unresolved(dependency, "type " + rendered + " cannot be satisfied by a bean");
             return;
         }
-        List<BeanModel> candidates = beans.stream()
-                .filter(bean -> types.isAssignable(types.erasure(bean.declaredType), requested))
-                .toList();
+        List<BeanModel> candidates = new ArrayList<>();
+        for (BeanModel bean : beans) {
+            if (types.isAssignable(types.erasure(bean.declaredType), requested)) {
+                candidates.add(bean);
+            }
+        }
         if (candidates.size() == 1) {
             dependency.resolved = candidates.get(0);
             return;
@@ -93,15 +97,23 @@ final class DependencyResolver {
             unresolved(dependency, "no bean of type " + rendered + " is known");
             return;
         }
-        List<BeanModel> exact = candidates.stream()
-                .filter(bean -> types.isSameType(types.erasure(bean.declaredType), types.erasure(requested)))
-                .toList();
+        List<BeanModel> exact = new ArrayList<>();
+        for (BeanModel bean : candidates) {
+            if (types.isSameType(types.erasure(bean.declaredType), types.erasure(requested))) {
+                exact.add(bean);
+            }
+        }
         if (exact.size() == 1) {
             dependency.resolved = exact.get(0);
             return;
         }
-        unresolved(dependency, "type " + rendered + " is implemented by several beans: " + describe(candidates)
-                + " (qualifiers are ignored)");
+        unresolved(dependency, "type " + rendered + " is implemented by several beans: "
+                + simpleNames(describe(candidates)) + " (qualifiers are ignored)");
+    }
+
+    /** The text with package prefixes removed, for messages read by people: {@code Repository<User>}. */
+    static String simpleNames(String qualified) {
+        return qualified.replaceAll("[a-z_][a-z0-9_]*\\.", "");
     }
 
     /** Records why nothing was chosen; the generated injector reports it if the point is still unbound when needed. */
@@ -110,8 +122,9 @@ final class DependencyResolver {
     }
 
     /**
-     * Computes the runtime lookup table for {@code getInstance(Class)}: for every bean and every one of
-     * its (erased) supertypes other than {@code Object}, the bean that type resolves to.
+     * Computes what {@code getInstance(Class)} can be asked for: for every bean and every one of its
+     * (erased) supertypes other than {@code Object}, the bean that type resolves to. The generator turns
+     * this into a chain of class comparisons.
      *
      * @return bindings from requested type to implementing bean; supertypes shared by several beans
      *         without an exact match are collected in {@code ambiguous} instead
@@ -120,22 +133,34 @@ final class DependencyResolver {
         Map<TypeElement, List<BeanModel>> bySupertype = new LinkedHashMap<>();
         for (BeanModel bean : beans) {
             for (TypeElement supertype : supertypes(bean.type)) {
-                bySupertype.computeIfAbsent(supertype, unused -> new ArrayList<>()).add(bean);
+                List<BeanModel> implementations = bySupertype.get(supertype);
+                if (implementations == null) {
+                    implementations = new ArrayList<>();
+                    bySupertype.put(supertype, implementations);
+                }
+                implementations.add(bean);
             }
         }
         Map<TypeElement, BeanModel> bindings = new LinkedHashMap<>();
-        bySupertype.forEach((supertype, implementations) -> {
+        for (Map.Entry<TypeElement, List<BeanModel>> entry : bySupertype.entrySet()) {
+            TypeElement supertype = entry.getKey();
+            List<BeanModel> implementations = entry.getValue();
             if (implementations.size() == 1) {
                 bindings.put(supertype, implementations.get(0));
-                return;
+                continue;
             }
-            List<BeanModel> exact = implementations.stream().filter(bean -> bean.type.equals(supertype)).toList();
+            List<BeanModel> exact = new ArrayList<>();
+            for (BeanModel bean : implementations) {
+                if (bean.type.equals(supertype)) {
+                    exact.add(bean);
+                }
+            }
             if (exact.size() == 1) {
                 bindings.put(supertype, exact.get(0));
             } else {
                 ambiguous.put(supertype, implementations);
             }
-        });
+        }
         return bindings;
     }
 
@@ -143,7 +168,12 @@ final class DependencyResolver {
     private Set<TypeElement> supertypes(TypeElement type) {
         Set<TypeElement> result = new LinkedHashSet<>();
         collectSupertypes(type.asType(), result);
-        result.removeIf(element -> element.getQualifiedName().contentEquals("java.lang.Object"));
+        Iterator<TypeElement> iterator = result.iterator();
+        while (iterator.hasNext()) {
+            if (iterator.next().getQualifiedName().contentEquals("java.lang.Object")) {
+                iterator.remove();
+            }
+        }
         return result;
     }
 
@@ -160,6 +190,11 @@ final class DependencyResolver {
     }
 
     static String describe(Collection<BeanModel> beans) {
-        return beans.stream().map(bean -> bean.qualifiedName).sorted().collect(Collectors.joining(", "));
+        List<String> names = new ArrayList<>();
+        for (BeanModel bean : beans) {
+            names.add(bean.qualifiedName);
+        }
+        Collections.sort(names);
+        return String.join(", ", names);
     }
 }

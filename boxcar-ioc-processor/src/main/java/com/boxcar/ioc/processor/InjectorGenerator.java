@@ -26,6 +26,7 @@ package com.boxcar.ioc.processor;
  * #L%
  */
 
+
 import com.boxcar.ioc.processor.BeanModel.Callback;
 import com.boxcar.ioc.processor.BeanModel.Constructor;
 import com.boxcar.ioc.processor.BeanModel.Dependency;
@@ -34,17 +35,19 @@ import com.boxcar.ioc.processor.BeanModel.MemberInjection;
 import com.boxcar.ioc.processor.BeanModel.MethodInjection;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
 import javax.lang.model.SourceVersion;
 import javax.lang.model.element.ExecutableElement;
 import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import javax.lang.model.element.VariableElement;
+import javax.lang.model.type.PrimitiveType;
 import javax.lang.model.type.TypeMirror;
 import javax.lang.model.util.Elements;
 import javax.lang.model.util.Types;
@@ -52,18 +55,23 @@ import javax.lang.model.util.Types;
 /**
  * Emits the source of {@code com.boxcar.Injector}.
  *
- * <p>The generated class is self-contained (it depends on the JDK only) and fully qualifies every
- * type it mentions. It uses no language feature newer than Java 8, because it is compiled at the
- * {@code -source} level of the user's compilation, not at the processor's own. Public members of
- * public classes are accessed directly so that javac type-checks the wiring; everything else goes
- * through cached reflective handles with {@code setAccessible}.
+ * <p>Everything the processor knows at compile time is written down as flat code, the way a person
+ * would wire the beans by hand. Every type the injector can hand out has a public getter: a bean's
+ * getter constructs it with its dependencies as constructor arguments (each a call to another
+ * getter), stores the instance in a {@code Map<Class<?>, Object>}, injects its fields and methods and
+ * runs its {@code @PostConstruct} callbacks, all in one method body; the getter of a type that is not
+ * a bean class states what the type resolves to. Beans that depend on each other are created by one
+ * method for the whole group, all constructed before any is injected. {@code getInstance(Class)} is
+ * a chain of {@code if (type == X.class) return getX()} over the types known at compile time.
  *
- * <p>Runtime strategy: a bean is registered in the instance map right after construction and before
- * its fields and methods are injected, so a dependency cycle simply finds the partially initialised
- * instance. Cycles that run only through constructors are rejected at compile time. Constructor
- * arguments are resolved before the map is re-checked, because resolving them may already have
- * created the bean through such a mixed cycle. {@code @PostConstruct} callbacks are queued and run
- * once the outermost {@code getInstance} call has wired everything, dependencies first.
+ * <p>The only runtime state is what {@code bind} needs: the instances and bean classes a test
+ * registered, consulted through {@code existing(Class)} at the top of every getter. A getter that can
+ * fail half-way rolls back what it added, so that a test can bind what was missing and call again.
+ *
+ * <p>The class depends on the JDK only and uses no syntax newer than Java 7 (in particular no lambdas
+ * or method references), because it is compiled at the {@code -source} level of the user's
+ * compilation, not at the processor's own. Public members of public classes are accessed directly so
+ * that javac type-checks the wiring; everything else goes through reflection with {@code setAccessible}.
  */
 final class InjectorGenerator {
 
@@ -71,20 +79,33 @@ final class InjectorGenerator {
     static final String CLASS_NAME = "Injector";
     static final String QUALIFIED_NAME = PACKAGE + "." + CLASS_NAME;
 
+    /** Classes the generated file declares; imports must not shadow them. */
+    private static final Set<String> DECLARED = Set.of(CLASS_NAME, "InjectionException");
+    /** Fields of the generated class, which no local variable may shadow. */
+    private static final Set<String> FIELDS = Set.of("BEANS", "instances", "boundInstances", "implementations");
+    /** Methods of the generated class, of Object and of Provider, which no getter may be named after. */
+    private static final Set<String> METHODS = Set.of("getInstance", "bind", "existing", "loadClass", "field",
+            "method", "constructor", "set", "invoke", "newInstance", "unwrap", "get", "toString", "hashCode", "equals",
+            "getClass", "clone", "finalize", "wait", "notify", "notifyAll");
+
     private final Types types;
     private final Elements elements;
     private final SourceVersion sourceVersion;
     private final TypeNames names;
     private final List<BeanModel> beans;
+    /** Every supertype of a bean, mapped to the bean it resolves to. */
     private final Map<TypeElement, BeanModel> bindings;
+    /** Supertypes shared by several beans without an exact match, with the candidates. */
     private final Map<TypeElement, List<BeanModel>> ambiguous;
 
-    private final Map<BeanModel, String> factoryNames = new LinkedHashMap<>();
-    private final Set<String> usedNames = new HashSet<>();
-    /** Reflective handle names by initializer, so that a member inherited by several beans gets one handle. */
-    private final Map<String, String> handleNames = new LinkedHashMap<>();
-    /** Declarations of the static reflective handles, emitted after the bindings. */
-    private final List<String> reflectiveHandles = new ArrayList<>();
+    private final Set<String> usedNames = new HashSet<>(METHODS);
+    private final Map<BeanModel, String> getterNames = new LinkedHashMap<>();
+    /** The group of mutually dependent beans each bean on a cycle belongs to. */
+    private final Map<BeanModel, CycleGroup> groups = new LinkedHashMap<>();
+    /** Getters for the dependency types that are not bean classes, in order of first use. */
+    private final List<Resolver> resolvers = new ArrayList<>();
+    /** Reflection helpers the wiring turned out to need. */
+    private final Set<String> helpers = new HashSet<>();
 
     /**
      * Creates a generator for the given beans and their resolved bindings.
@@ -101,16 +122,114 @@ final class InjectorGenerator {
         this.beans = List.copyOf(beans);
         this.bindings = bindings;
         this.ambiguous = ambiguous;
+        nameGetters();
+        Map<BeanModel, List<BeanModel>> edges = CycleDetector.edges(this.beans, false);
+        Map<BeanModel, List<BeanModel>> constructorEdges = CycleDetector.edges(this.beans, true);
+        for (List<BeanModel> component : CycleDetector.components(edges)) {
+            CycleGroup group = new CycleGroup(component, edges, constructorEdges);
+            for (BeanModel member : component) {
+                groups.put(member, group);
+            }
+        }
         for (BeanModel bean : this.beans) {
-            factoryNames.put(bean, uniqueName("bean_" + identifier(bean.type)));
+            for (Dependency dependency : bean.dependencies()) {
+                if (!resolvesToBeanClass(dependency)) {
+                    resolver(dependency);
+                }
+            }
         }
     }
 
-    String generate() {
-        CodeWriter factories = new CodeWriter().indent();
+    /**
+     * Names each bean's getter {@code getX} after its simple name. Beans sharing a simple name are told
+     * apart by their package's last segment ({@code getBillingConfig}, {@code getShippingConfig}), or
+     * failing that by their qualified name.
+     */
+    private void nameGetters() {
+        Map<String, Integer> bySimpleName = new HashMap<>();
+        Map<String, Integer> byPackageAndSimpleName = new HashMap<>();
         for (BeanModel bean : beans) {
-            factories.blank();
-            writeFactory(factories, bean);
+            count(bySimpleName, simpleGetterName(bean));
+            count(byPackageAndSimpleName, packageGetterName(bean));
+        }
+        for (BeanModel bean : beans) {
+            String name;
+            if (bySimpleName.get(simpleGetterName(bean)) == 1) {
+                name = simpleGetterName(bean);
+            } else if (byPackageAndSimpleName.get(packageGetterName(bean)) == 1) {
+                name = packageGetterName(bean);
+            } else {
+                name = "get" + elements.getBinaryName(bean.type).toString().replace('.', '_').replace('$', '_');
+            }
+            getterNames.put(bean, uniqueName(name));
+        }
+    }
+
+    private static void count(Map<String, Integer> counts, String key) {
+        counts.put(key, counts.getOrDefault(key, 0) + 1);
+    }
+
+    private static String simpleGetterName(BeanModel bean) {
+        return "get" + bean.type.getSimpleName();
+    }
+
+    private String packageGetterName(BeanModel bean) {
+        String packageName = elements.getPackageOf(bean.type).getQualifiedName().toString();
+        String segment = packageName.substring(packageName.lastIndexOf('.') + 1);
+        return "get" + capitalize(segment) + bean.type.getSimpleName();
+    }
+
+    /** Whether the dependency's requested type is exactly the class of the bean it resolves to. */
+    private boolean resolvesToBeanClass(Dependency dependency) {
+        return dependency.resolved != null && types.isSameType(types.erasure(dependency.requestedType),
+                types.erasure(dependency.resolved.declaredType));
+    }
+
+    /** The resolver for the dependency's requested type, created on first use. */
+    private Resolver resolver(Dependency dependency) {
+        TypeMirror requested = boxed(dependency.requestedType);
+        for (Resolver resolver : resolvers) {
+            if (types.isSameType(resolver.type, requested)) {
+                resolver.injectionPoints.add(shortDescription(dependency));
+                return resolver;
+            }
+        }
+        Resolver resolver = new Resolver(requested, dependency);
+        resolvers.add(resolver);
+        return resolver;
+    }
+
+    /** The injection point's description with the owning class by simple name, e.g. {@code OrderService.gateway}. */
+    private static String shortDescription(Dependency dependency) {
+        String description = dependency.description;
+        int member = description.indexOf('(');
+        if (member < 0) {
+            member = description.lastIndexOf('.');
+        }
+        int owner = description.lastIndexOf('.', member - 1);
+        return owner < 0 ? description : description.substring(owner + 1);
+    }
+
+    private TypeMirror boxed(TypeMirror type) {
+        return type.getKind().isPrimitive() ? types.boxedClass((PrimitiveType) type).asType() : type;
+    }
+
+    String generate() {
+        // The wiring first: writing it collects the reflection helpers it needs.
+        CodeWriter wiring = new CodeWriter().indent();
+        Set<CycleGroup> written = new HashSet<>();
+        for (BeanModel bean : beans) {
+            CycleGroup group = groups.get(bean);
+            if (group != null && written.add(group)) {
+                wiring.blank();
+                writeGroup(wiring, group);
+            }
+            wiring.blank();
+            writeGetter(wiring, bean);
+        }
+        for (Resolver resolver : resolvers) {
+            wiring.blank();
+            writeResolver(wiring, resolver);
         }
 
         CodeWriter out = new CodeWriter();
@@ -118,26 +237,18 @@ final class InjectorGenerator {
         out.blank();
         writeClassJavadoc(out);
         out.line("@" + generatedAnnotation() + "(" + CodeWriter.literal(InjectorProcessor.class.getName()) + ")");
-        out.line("@SuppressWarnings({\"unchecked\", \"rawtypes\", \"cast\"})");
+        out.line("@SuppressWarnings({\"unchecked\", \"rawtypes\"})");
         out.open("public class " + CLASS_NAME + " {");
         out.blank();
-        writeBindings(out);
-        out.blank();
-        if (!reflectiveHandles.isEmpty()) {
-            out.line("// Handles for members that are not public and therefore cannot be accessed directly.");
-            reflectiveHandles.forEach(out::line);
-            out.blank();
-        }
         writeState(out);
-        writeConstructor(out);
         writePublicApi(out);
-        writeResolution(out);
-        out.raw(factories.toString());
+        writeExisting(out);
+        out.raw(wiring.toString());
         out.blank();
         writeReflectionHelpers(out);
         writeExceptionClass(out);
         out.close();
-        return out.toString();
+        return Imports.apply(out.toString(), DECLARED, elements);
     }
 
     /**
@@ -145,9 +256,11 @@ final class InjectorGenerator {
      * {@code javax.annotation.processing.Generated} from Java 9 on, {@code javax.annotation.Generated} before.
      */
     private String generatedAnnotation() {
-        return sourceVersion.compareTo(SourceVersion.RELEASE_8) > 0
+        String qualifiedName = sourceVersion.compareTo(SourceVersion.RELEASE_8) > 0
                 ? "javax.annotation.processing.Generated"
                 : "javax.annotation.Generated";
+        TypeElement annotation = elements.getTypeElement(qualifiedName);
+        return annotation != null ? Imports.reference(annotation) : qualifiedName;
     }
 
     private void writeClassJavadoc(CodeWriter out) {
@@ -172,44 +285,34 @@ final class InjectorGenerator {
         out.line(" */");
     }
 
-    private void writeBindings(CodeWriter out) {
-        out.line("/** Requested type to implementation class, for every bean and each of its unambiguous supertypes."
-                + " */");
-        out.line("private static final java.util.Map<Class<?>, Class<?>> BINDINGS = new java.util.HashMap<>();");
-        out.line("/** Supertypes shared by several beans, mapped to their names for error messages. */");
-        out.line("private static final java.util.Map<Class<?>, String> AMBIGUOUS = new java.util.HashMap<>();");
-        out.blank();
-        out.open("static {");
-        bindings.forEach((requested, bean) -> out.line("BINDINGS.put(" + classLiteral(requested) + ", "
-                + classLiteral(bean.type) + ");"));
-        ambiguous.forEach((requested, candidates) -> out.line("AMBIGUOUS.put(" + classLiteral(requested) + ", "
-                + CodeWriter.literal(DependencyResolver.describe(candidates)) + ");"));
-        out.close();
-    }
-
     private void writeState(CodeWriter out) {
-        out.line("/** Bean instances by implementation class, plus everything registered through {@link #bind}. */");
-        out.line("private final java.util.Map<Class<?>, Object> instances = new java.util.HashMap<>();");
-        out.line("/** Implementation classes registered through {@link #bind(Class, Class)}, by requested type. */");
-        out.line("private final java.util.Map<Class<?>, Class<?>> implementations = new java.util.HashMap<>();");
-        out.line("/** Types whose instance has been created, injected or returned; their bindings can no longer be"
-                + " replaced. */");
-        out.line("private final java.util.Set<Class<?>> resolved = new java.util.HashSet<>();");
-        out.line("private final java.util.Map<Class<?>, java.util.function.Supplier<?>> factories = new"
-                + " java.util.HashMap<>();");
-        out.line("/** {@code @PostConstruct} callbacks of beans wired during the current resolution, dependencies"
-                + " first. */");
-        out.line("private final java.util.ArrayDeque<Runnable> postConstructQueue = new java.util.ArrayDeque<>();");
-        out.line("private boolean resolving;");
-        out.blank();
-    }
-
-    private void writeConstructor(CodeWriter out) {
-        out.open("public " + CLASS_NAME + "() {");
-        for (BeanModel bean : beans) {
-            out.line("factories.put(" + classLiteral(bean.type) + ", this::" + factoryNames.get(bean) + ");");
+        out.line("/** The bean classes, which {@link #bind(Class, Class)} accepts as implementations. */");
+        String declaration = "private static final " + jdk("java.util.List") + "<Class<?>> BEANS = "
+                + jdk("java.util.Arrays") + ".asList(";
+        if (beans.isEmpty()) {
+            out.line(declaration + ");");
+        } else {
+            out.line(declaration);
+            out.indent().indent();
+            for (int i = 0; i < beans.size(); i++) {
+                out.line(classLiteral(beans.get(i).type) + (i < beans.size() - 1 ? "," : ");"));
+            }
+            out.outdent().outdent();
         }
-        out.close();
+        out.blank();
+        out.line("/**");
+        out.line(" * Every type resolved so far, mapped to its instance: the beans created, and the bound instances"
+                + " and");
+        out.line(" * implementations once they have been used. A type in this map can no longer be bound.");
+        out.line(" */");
+        out.line("private final " + jdk("java.util.Map") + "<Class<?>, Object> instances = new "
+                + jdk("java.util.HashMap") + "<>();");
+        out.line("/** Instances registered through {@link #bind(Class, Object)}, by type. */");
+        out.line("private final " + jdk("java.util.Map") + "<Class<?>, Object> boundInstances = new "
+                + jdk("java.util.HashMap") + "<>();");
+        out.line("/** Bean classes registered through {@link #bind(Class, Class)}, by the type they implement. */");
+        out.line("private final " + jdk("java.util.Map") + "<Class<?>, Class<?>> implementations = new "
+                + jdk("java.util.HashMap") + "<>();");
         out.blank();
     }
 
@@ -217,13 +320,41 @@ final class InjectorGenerator {
         out.line("/**");
         out.line(" * Returns the bean of the given type, creating it and everything it depends on if necessary.");
         out.line(" *");
+        out.line(" * <p>This is the entry point shared with the reflection-based {@code Injector}. Every type known at"
+                + " compile");
+        out.line(" * time also has a getter of its own ({@link #" + firstGetterName() + "()} and so on), which does the"
+                + " same");
+        out.line(" * without the dispatch and with the type checked by the compiler; use it when the project does not"
+                + " need to");
+        out.line(" * stay source-compatible with the reflection-based injector.");
+        out.line(" *");
         out.line(" * @param type a bean class, a supertype implemented by exactly one bean, or a type passed to {@link"
                 + " #bind}");
         out.line(" * @throws InjectionException if the type is unknown or a dependency cannot be satisfied");
         out.line(" */");
         out.open("public <T> T getInstance(Class<T> type) {");
-        out.line("java.util.Objects.requireNonNull(type, \"type\");");
-        out.line("return type.cast(enter(() -> resolve(type)));");
+        for (Map.Entry<TypeElement, BeanModel> binding : bindings.entrySet()) {
+            out.open("if (type == " + classLiteral(binding.getKey()) + ") {");
+            out.line("return type.cast(" + supertypeExpression(binding.getKey(), binding.getValue()) + ");");
+            out.close();
+        }
+        out.line("// Not a type known at compile time: only a binding can provide it.");
+        out.line("T bound = existing(" + jdk("java.util.Objects") + ".requireNonNull(type, \"type\"));");
+        out.open("if (bound != null) {");
+        out.line("return bound;");
+        out.close();
+        for (Map.Entry<TypeElement, List<BeanModel>> entry : ambiguous.entrySet()) {
+            out.open("if (type == " + classLiteral(entry.getKey()) + ") {");
+            out.statement("throw new InjectionException(", "Type " + entry.getKey().getSimpleName()
+                    + " is implemented by several beans ("
+                    + DependencyResolver.simpleNames(DependencyResolver.describe(entry.getValue()))
+                    + "); request one of them, or bind an implementation or instance for the type", ");");
+            out.close();
+        }
+        out.line("throw new InjectionException(\"No bean of type \" + type.getName() + \" is known to this Injector"
+                + " and none was bound;\"");
+        out.line("        + \" use bind(\" + type.getSimpleName() + \".class, ...) to supply an implementation class"
+                + " or an instance\");");
         out.close();
         out.blank();
         out.line("/**");
@@ -235,17 +366,14 @@ final class InjectorGenerator {
                 + " binding is fixed.");
         out.line(" *");
         out.line(" * @return this injector, for chaining");
-        out.line(" * @throws IllegalStateException if {@code type} has already been resolved or a resolution is in"
-                + " progress");
+        out.line(" * @throws IllegalStateException if {@code type} has already been resolved");
         out.line(" */");
         out.open("public <T> " + CLASS_NAME + " bind(Class<T> type, T instance) {");
-        out.line("java.util.Objects.requireNonNull(type, \"type\");");
-        out.line("java.util.Objects.requireNonNull(instance, \"instance\");");
-        out.open("synchronized (instances) {");
-        out.line("checkBindable(type);");
+        out.line(jdk("java.util.Objects") + ".requireNonNull(type, \"type\");");
+        out.line(jdk("java.util.Objects") + ".requireNonNull(instance, \"instance\");");
+        writeBindableCheck(out);
         out.line("implementations.remove(type);");
-        out.line("instances.put(type, instance);");
-        out.close();
+        out.line("boundInstances.put(type, instance);");
         out.line("return this;");
         out.close();
         out.blank();
@@ -259,13 +387,12 @@ final class InjectorGenerator {
         out.line(" * @return this injector, for chaining");
         out.line(" * @throws IllegalArgumentException if {@code implementation} is not a bean managed by this"
                 + " injector");
-        out.line(" * @throws IllegalStateException if {@code type} has already been resolved or a resolution is in"
-                + " progress");
+        out.line(" * @throws IllegalStateException if {@code type} has already been resolved");
         out.line(" */");
         out.open("public <T> " + CLASS_NAME + " bind(Class<T> type, Class<? extends T> implementation) {");
-        out.line("java.util.Objects.requireNonNull(type, \"type\");");
-        out.line("java.util.Objects.requireNonNull(implementation, \"implementation\");");
-        out.open("if (!factories.containsKey(implementation)) {");
+        out.line(jdk("java.util.Objects") + ".requireNonNull(type, \"type\");");
+        out.line(jdk("java.util.Objects") + ".requireNonNull(implementation, \"implementation\");");
+        out.open("if (!BEANS.contains(implementation)) {");
         out.line("throw new IllegalArgumentException(implementation.getName() + \" is not a bean managed by this"
                 + " Injector; bind an instance instead\");");
         out.close();
@@ -273,8 +400,7 @@ final class InjectorGenerator {
         out.line("throw new IllegalArgumentException(\"Cannot bind \" + type.getName() + \" to \" +"
                 + " implementation.getName());");
         out.close();
-        out.open("synchronized (instances) {");
-        out.line("checkBindable(type);");
+        writeBindableCheck(out);
         out.open("for (Class<?> next = implementations.get(implementation); next != null; next ="
                 + " implementations.get(next)) {");
         out.open("if (next == type) {");
@@ -282,290 +408,467 @@ final class InjectorGenerator {
                 + " implementation.getName() + \" would form a cycle\");");
         out.close();
         out.close();
-        out.line("instances.remove(type);");
+        out.line("boundInstances.remove(type);");
         out.line("implementations.put(type, implementation);");
-        out.close();
         out.line("return this;");
         out.close();
         out.blank();
-        out.open("private void checkBindable(Class<?> type) {");
-        out.open("if (resolving) {");
-        out.line("throw new IllegalStateException(\"Cannot bind \" + type.getName() + \" while a resolution is in"
-                + " progress\");");
-        out.close();
-        out.open("if (resolved.contains(type)) {");
+    }
+
+    /** The getter named in the {@code getInstance} javadoc as an example; the first bean's, or a placeholder. */
+    private String firstGetterName() {
+        return beans.isEmpty() ? "getInstance" : getterNames.get(beans.get(0));
+    }
+
+    private void writeBindableCheck(CodeWriter out) {
+        out.open("if (instances.containsKey(type)) {");
         out.line("throw new IllegalStateException(type.getName() + \" has already been resolved by this Injector (an"
                 + " instance was\"");
         out.line("        + \" created, injected or returned); bind before the type is first used\");");
         out.close();
-        out.close();
-        out.blank();
     }
 
-    private void writeResolution(CodeWriter out) {
-        out.line("/** Runs a resolution, and if it is the outermost one, fires the queued @PostConstruct callbacks"
-                + " afterwards. */");
-        out.open("private <T> T enter(java.util.function.Supplier<T> resolution) {");
-        out.open("synchronized (instances) {");
-        out.open("if (resolving) {");
-        out.line("return resolution.get();");
+    /** {@code existing}: the one runtime lookup, consulted at the top of every getter. */
+    private void writeExisting(CodeWriter out) {
+        out.line("/** The instance created or bound for {@code type} so far; null if there is none yet. */");
+        out.open("private <T> T existing(Class<T> type) {");
+        out.line("Object instance = instances.get(type);");
+        out.open("if (instance == null) {");
+        out.line("instance = boundInstances.get(type);");
+        out.open("if (instance == null && implementations.containsKey(type)) {");
+        out.line("instance = getInstance(implementations.get(type));");
         out.close();
-        out.line("resolving = true;");
-        out.line("java.util.Set<Class<?>> before = new java.util.HashSet<>(instances.keySet());");
-        out.line("java.util.Set<Class<?>> resolvedBefore = new java.util.HashSet<>(resolved);");
-        out.open("try {");
-        out.line("T result = resolution.get();");
-        out.line("Runnable callback;");
-        out.open("while ((callback = postConstructQueue.poll()) != null) {");
-        out.line("callback.run();");
+        out.open("if (instance != null) {");
+        out.line("// In use: from now on the binding of this type cannot be replaced.");
+        out.line("instances.put(type, instance);");
         out.close();
-        out.line("return result;");
+        out.close();
+        out.line("return type.cast(instance);");
+        out.close();
+    }
+
+    /** How {@code getInstance} resolves a supertype: its own getter if it is injected somewhere, else the bean's. */
+    private String supertypeExpression(TypeElement supertype, BeanModel bean) {
+        for (Resolver resolver : resolvers) {
+            if (types.isSameType(resolver.type, types.erasure(supertype.asType()))) {
+                return resolver.name + "()";
+            }
+        }
+        return getterNames.get(bean) + "()";
+    }
+
+    /**
+     * The getter of a bean: the whole construction in one method body. If anything after the instance has
+     * been stored can fail (a dependency, an injection, a callback), the getter rolls back what it added, so
+     * that the caller can bind what was missing and call again.
+     */
+    private void writeGetter(CodeWriter out, BeanModel bean) {
+        String type = typeName(bean);
+        String literal = classLiteral(bean.type);
+        CycleGroup group = groups.get(bean);
+        Scope scope = new Scope();
+        String local = scope.declare(localName(bean.type.getSimpleName().toString()));
+
+        if (group != null) {
+            out.line("/** Created together with " + group.describeOthers(bean) + ", see {@link #" + group.name
+                    + "}. */");
+        }
+        out.open("public " + type + " " + getterNames.get(bean) + "() {");
+        out.line(type + " " + local + " = existing(" + literal + ");");
+        if (group != null) {
+            out.open("if (" + local + " == null) {");
+            out.line(group.name + "();");
+            out.line(local + " = (" + type + ") instances.get(" + literal + ");");
+            out.close();
+            out.line("return " + local + ";");
+            out.close();
+            return;
+        }
+        scope.locals.put(bean, local);
+        out.open("if (" + local + " != null) {");
+        out.line("return " + local + ";");
+        out.close();
+        boolean rollback = !bean.dependencies().isEmpty() || !bean.postConstructs.isEmpty();
+        if (rollback) {
+            writeSnapshot(out);
+            out.open("try {");
+        }
+        writeConstruction(out, bean, local, scope);
+        out.line("instances.put(" + literal + ", " + local + ");");
+        writeInjection(out, bean, local, scope);
+        writeCallbacks(out, bean, local);
+        out.line("return " + local + ";");
+        if (rollback) {
+            writeRollback(out);
+        }
+        out.close();
+    }
+
+    private void writeSnapshot(CodeWriter out) {
+        out.line(jdk("java.util.Set") + "<Class<?>> before = new " + jdk("java.util.HashSet")
+                + "<>(instances.keySet());");
+    }
+
+    /** Closes the {@code try} opened after {@link #writeSnapshot}: discards everything added since. */
+    private void writeRollback(CodeWriter out) {
         out.close("} catch (RuntimeException | Error e) {");
         out.indent();
-        out.line("// Roll back so that a retry after bind() does not see half-wired instances, and so that the");
-        out.line("// bindings the discarded instances consumed can be replaced again.");
         out.line("instances.keySet().retainAll(before);");
-        out.line("resolved.retainAll(resolvedBefore);");
-        out.line("postConstructQueue.clear();");
         out.line("throw e;");
-        out.close("} finally {");
-        out.indent();
-        out.line("resolving = false;");
-        out.close();
-        out.close();
-        out.close();
-        out.blank();
-        out.open("private Object resolve(Class<?> type) {");
-        out.line("Object existing = existing(type);");
-        out.open("if (existing != null) {");
-        out.line("return existing;");
-        out.close();
-        out.line("Class<?> implementation = BINDINGS.get(type);");
-        out.open("if (implementation == null) {");
-        out.line("String candidates = AMBIGUOUS.get(type);");
-        out.line("throw new InjectionException(candidates != null");
-        out.line("        ? \"Type \" + type.getName() + \" is implemented by several beans (\" + candidates");
-        out.line("                + \"); request one of them, or bind an implementation or instance for the type\"");
-        out.line("        : \"No bean of type \" + type.getName() + \" is known to this Injector and none was"
-                + " bound;\"");
-        out.line("                + \" use bind(\" + type.getSimpleName() + \".class, ...) to supply an implementation"
-                + " class or an instance\");");
-        out.close();
-        out.open("if (implementation != type) {");
-        out.line("return resolve(implementation);");
-        out.close();
-        out.line("return factories.get(type).get();");
-        out.close();
-        out.blank();
-        out.line("/** The instance created or bound for {@code type}, following a bound implementation class; null if"
-                + " none yet. */");
-        out.open("private Object existing(Class<?> type) {");
-        out.line("Object existing = instances.get(type);");
-        out.open("if (existing == null) {");
-        out.line("Class<?> bound = implementations.get(type);");
-        out.line("existing = bound != null ? resolve(bound) : null;");
-        out.close();
-        out.open("if (existing != null) {");
-        out.line("// Handed out: from now on the binding of this type cannot be replaced.");
-        out.line("resolved.add(type);");
-        out.close();
-        out.line("return existing;");
-        out.close();
-        out.blank();
-        out.line("/** A dependency resolved at compile time: a binding for the declared type still takes precedence."
-                + " */");
-        out.open("private <T> T dependency(Class<T> declaredType, java.util.function.Supplier<?> implementation) {");
-        out.line("Object bound = existing(declaredType);");
-        out.line("return declaredType.cast(bound != null ? bound : implementation.get());");
-        out.close();
-        out.blank();
-        out.line("/** A dependency that could not be resolved at compile time and must have been bound. */");
-        out.open("private <T> T required(Class<T> declaredType, String injectionPoint, String reason) {");
-        out.line("Object bound = existing(declaredType);");
-        out.open("if (bound == null) {");
-        out.line("throw new InjectionException(\"Cannot inject \" + injectionPoint + \": \" + reason");
-        out.line("        + \". Register an instance with Injector.bind(\" + declaredType.getSimpleName() + \".class,"
-                + " ...) first\");");
-        out.close();
-        out.line("return declaredType.cast(bound);");
         out.close();
     }
 
-    private void writeFactory(CodeWriter out, BeanModel bean) {
-        String type = names.render(types.erasure(bean.declaredType));
-        String literal = classLiteral(bean.type);
-
-        out.line("/** {@code " + bean.qualifiedName + "} (@" + simpleName(bean.beanAnnotation) + ") */");
-        out.open("private " + type + " " + factoryNames.get(bean) + "() {");
-        out.line("Object existing = existing(" + literal + ");");
-        out.open("if (existing != null) {");
-        out.line("return (" + type + ") existing;");
-        out.close();
-
-        Constructor constructor = bean.constructor;
-        List<String> arguments = new ArrayList<>();
-        for (int i = 0; i < constructor.parameters().size(); i++) {
-            Dependency parameter = constructor.parameters().get(i);
-            String local = "arg" + i;
-            String localType = names.isAccessible(parameter.declaredType)
-                    ? names.render(parameter.declaredType)
-                    : "Object";
-            out.line(localType + " " + local + " = " + valueExpression(parameter) + ";");
-            arguments.add(local);
+    /**
+     * The method creating a group of mutually dependent beans: every instance is constructed (in an order
+     * that satisfies the constructor dependencies among them) before any is injected, so the cycle is closed
+     * once all of them exist, and the callbacks run after all injection. A member whose class is bound is
+     * used as bound and left alone. The group is one unit of work and rolls back as one.
+     */
+    private void writeGroup(CodeWriter out, CycleGroup group) {
+        Scope scope = new Scope();
+        Map<BeanModel, String> created = new HashMap<>();
+        for (Map.Entry<BeanModel, String> local : localNames(group.members).entrySet()) {
+            scope.locals.put(local.getKey(), scope.declare(local.getValue()));
         }
-        if (!arguments.isEmpty()) {
-            out.line("// Resolving constructor arguments may already have created this bean through a dependency"
-                    + " cycle.");
-            out.line("existing = existing(" + literal + ");");
-            out.open("if (existing != null) {");
-            out.line("return (" + type + ") existing;");
+        out.line("/**");
+        out.line(" * Creates " + group.describe() + ", which depend on each other: all of them are constructed before"
+                + " any is");
+        out.line(" * injected, and all are injected before their @PostConstruct callbacks run. A member whose class is"
+                + " bound");
+        out.line(" * is used as bound.");
+        out.line(" */");
+        out.open("private void " + group.name + "() {");
+        writeSnapshot(out);
+        out.open("try {");
+        for (BeanModel member : group.members) {
+            String type = typeName(member);
+            String local = scope.locals.get(member);
+            out.line(type + " " + local + " = existing(" + classLiteral(member.type) + ");");
+            if (member.members.isEmpty() && member.postConstructs.isEmpty()) {
+                out.open("if (" + local + " == null) {");
+            } else {
+                String flag = scope.declare("new" + capitalize(local));
+                created.put(member, flag);
+                out.line("boolean " + flag + " = " + local + " == null;");
+                out.open("if (" + flag + ") {");
+            }
+            writeConstruction(out, member, local, scope);
+            out.line("instances.put(" + classLiteral(member.type) + ", " + local + ");");
             out.close();
         }
-        out.line(type + " instance = " + constructorCall(bean, constructor, arguments) + ";");
-        out.line("instances.put(" + literal + ", instance);");
-        out.line("resolved.add(" + literal + ");");
+        for (BeanModel member : group.members) {
+            if (!member.members.isEmpty()) {
+                out.open("if (" + created.get(member) + ") {");
+                writeInjection(out, member, scope.locals.get(member), scope);
+                out.close();
+            }
+        }
+        for (BeanModel member : group.callbackOrder) {
+            if (!member.postConstructs.isEmpty()) {
+                out.open("if (" + created.get(member) + ") {");
+                writeCallbacks(out, member, scope.locals.get(member));
+                out.close();
+            }
+        }
+        writeRollback(out);
+        out.close();
+    }
 
+    /** Assigns a new instance of the bean to {@code target}, with its dependencies as constructor arguments. */
+    private void writeConstruction(CodeWriter out, BeanModel bean, String target, Scope scope) {
+        Constructor constructor = bean.constructor;
+        List<String> arguments = new ArrayList<>();
+        for (Dependency parameter : constructor.parameters()) {
+            arguments.add(argument(parameter, scope));
+        }
+        boolean direct = constructor.element().getModifiers().contains(Modifier.PUBLIC)
+                && allAccessible(constructor.parameters());
+        if (direct) {
+            out.lines(target + " = new " + typeName(bean) + (bean.type.getTypeParameters().isEmpty() ? "" : "<>")
+                    + "(" + String.join(", ", arguments) + ");");
+            return;
+        }
+        helpers.add("constructor");
+        StringBuilder call = new StringBuilder(target).append(" = newInstance(constructor(")
+                .append(classLiteral(bean.type)).append(parameterLiterals(constructor.element())).append(")");
+        for (String argument : arguments) {
+            call.append(", ").append(argument);
+        }
+        out.lines(call.append(");").toString());
+    }
+
+    /** Whether every dependency's declared type can be named from the generated class. */
+    private boolean allAccessible(List<Dependency> dependencies) {
+        for (Dependency dependency : dependencies) {
+            if (!names.isAccessible(dependency.declaredType)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void writeInjection(CodeWriter out, BeanModel bean, String target, Scope scope) {
         for (MemberInjection member : bean.members) {
             if (member instanceof FieldInjection field) {
-                writeFieldInjection(out, field);
+                writeFieldInjection(out, field, target, scope);
             } else if (member instanceof MethodInjection method) {
-                writeMethodInjection(out, method);
+                writeMethodInjection(out, method, target, scope);
             } else {
                 throw new IllegalStateException("Unknown member type: " + member);
             }
         }
-        for (Callback callback : bean.postConstructs) {
-            out.line("postConstructQueue.add(() -> " + callbackCall(callback) + ");");
-        }
-        out.line("return instance;");
-        out.close();
     }
 
-    private String constructorCall(BeanModel bean, Constructor constructor, List<String> arguments) {
-        boolean direct = constructor.element().getModifiers().contains(Modifier.PUBLIC)
-                && constructor.parameters().stream().allMatch(p -> names.isAccessible(p.declaredType));
-        if (direct) {
-            return "new " + names.render(types.erasure(bean.declaredType))
-                    + (bean.type.getTypeParameters().isEmpty() ? "" : "<>")
-                    + "(" + String.join(", ", arguments) + ")";
-        }
-        String handle = declareHandle("CONSTRUCTOR_" + identifier(bean.type), "java.lang.reflect.Constructor<?>",
-                "constructor(" + classLiteral(bean.type) + parameterLiterals(constructor.element()) + ")");
-        return "(" + names.render(types.erasure(bean.declaredType)) + ") newInstance(" + handle
-                + arguments.stream().map(a -> ", " + a).collect(Collectors.joining()) + ")";
-    }
-
-    private void writeFieldInjection(CodeWriter out, FieldInjection injection) {
+    private void writeFieldInjection(CodeWriter out, FieldInjection injection, String target, Scope scope) {
         VariableElement field = injection.field();
-        Dependency dependency = injection.dependency();
-        boolean direct = field.getModifiers().contains(Modifier.PUBLIC) && names.isAccessible(dependency.declaredType);
-        if (direct) {
-            out.line("instance." + field.getSimpleName() + " = " + valueExpression(dependency) + ";");
+        String value = argument(injection.dependency(), scope);
+        if (field.getModifiers().contains(Modifier.PUBLIC) && names.isAccessible(injection.dependency().declaredType)) {
+            out.lines(target + "." + field.getSimpleName() + " = " + value + ";");
             return;
         }
-        String handle = declareHandle("FIELD_" + identifier(injection.owner()) + "_" + field.getSimpleName(),
-                "java.lang.reflect.Field",
-                "field(" + classLiteral(injection.owner()) + ", "
-                        + CodeWriter.literal(field.getSimpleName().toString()) + ")");
-        out.line("set(" + handle + ", instance, " + valueExpression(dependency) + ");");
+        helpers.add("field");
+        out.lines("set(field(" + classLiteral(injection.owner()) + ", "
+                + CodeWriter.literal(field.getSimpleName().toString()) + "), " + target + ", " + value + ");");
     }
 
-    private void writeMethodInjection(CodeWriter out, MethodInjection injection) {
+    private void writeMethodInjection(CodeWriter out, MethodInjection injection, String target, Scope scope) {
         ExecutableElement method = injection.method();
-        boolean direct = method.getModifiers().contains(Modifier.PUBLIC)
-                && injection.parameters().stream().allMatch(p -> names.isAccessible(p.declaredType));
-        if (direct) {
-            out.line("instance." + method.getSimpleName() + "(" + injection.parameters().stream()
-                    .map(this::typedExpression).collect(Collectors.joining(", ")) + ");");
+        List<String> arguments = new ArrayList<>();
+        for (Dependency parameter : injection.parameters()) {
+            arguments.add(argument(parameter, scope));
+        }
+        if (method.getModifiers().contains(Modifier.PUBLIC) && allAccessible(injection.parameters())) {
+            out.lines(target + "." + method.getSimpleName() + "(" + String.join(", ", arguments) + ");");
             return;
         }
-        String handle = declareHandle("METHOD_" + identifier(injection.owner()) + "_" + method.getSimpleName(),
-                "java.lang.reflect.Method",
-                "method(" + classLiteral(injection.owner()) + ", "
-                        + CodeWriter.literal(method.getSimpleName().toString())
-                        + parameterLiterals(method) + ")");
-        out.line("invoke(" + handle + ", instance" + injection.parameters().stream()
-                .map(p -> ", " + valueExpression(p)).collect(Collectors.joining()) + ");");
+        helpers.add("method");
+        StringBuilder call = new StringBuilder("invoke(method(").append(classLiteral(injection.owner()))
+                .append(", ").append(CodeWriter.literal(method.getSimpleName().toString()))
+                .append(parameterLiterals(method)).append("), ").append(target);
+        for (String argument : arguments) {
+            call.append(", ").append(argument);
+        }
+        out.lines(call.append(");").toString());
     }
 
-    private String callbackCall(Callback callback) {
-        ExecutableElement method = callback.method();
-        if (method.getModifiers().contains(Modifier.PUBLIC)) {
-            return "instance." + method.getSimpleName() + "()";
+    private void writeCallbacks(CodeWriter out, BeanModel bean, String target) {
+        for (Callback callback : bean.postConstructs) {
+            ExecutableElement method = callback.method();
+            if (method.getModifiers().contains(Modifier.PUBLIC)) {
+                out.line(target + "." + method.getSimpleName() + "();");
+                continue;
+            }
+            helpers.add("method");
+            out.line("invoke(method(" + classLiteral(callback.owner()) + ", "
+                    + CodeWriter.literal(method.getSimpleName().toString()) + "), " + target + ");");
         }
-        String handle = declareHandle("METHOD_" + identifier(callback.owner()) + "_" + method.getSimpleName(),
-                "java.lang.reflect.Method",
-                "method(" + classLiteral(callback.owner()) + ", "
-                        + CodeWriter.literal(method.getSimpleName().toString()) + ")");
-        return "invoke(" + handle + ", instance)";
     }
 
     /** Class literals of the erased declared parameter types, as needed for reflective lookup. */
     private String parameterLiterals(ExecutableElement executable) {
-        return executable.getParameters().stream()
-                .map(p -> ", " + names.classLiteral(p.asType()))
-                .collect(Collectors.joining());
-    }
-
-    /** An expression producing the value to inject, cast to the declared type where that is nameable. */
-    private String typedExpression(Dependency dependency) {
-        String value = valueExpression(dependency);
-        if (dependency.provider || !names.isAccessible(dependency.declaredType)) {
-            return value;
+        StringBuilder literals = new StringBuilder();
+        for (VariableElement parameter : executable.getParameters()) {
+            literals.append(", ").append(classLiteral(parameter.asType()));
         }
-        return "(" + names.render(dependency.declaredType) + ") " + value;
+        return literals.toString();
     }
 
-    private String valueExpression(Dependency dependency) {
+    /**
+     * The expression supplying the value for an injection point. A {@code Provider} is an anonymous class
+     * whose {@code get()} calls the getter, spread over several lines; {@link CodeWriter#lines} lays it out.
+     */
+    private String argument(Dependency dependency, Scope scope) {
         if (!dependency.provider) {
-            return resolutionExpression(dependency);
+            return resolutionExpression(dependency, scope);
         }
-        // A Provider is a lambda; casting it fixes the target type wherever the lambda is passed as Object.
-        String providerType = names.isAccessible(dependency.declaredType)
-                ? names.render(dependency.declaredType)
-                : names.renderErasure(dependency.declaredType) + "<?>";
-        return "(" + providerType + ") () -> enter(() -> " + resolutionExpression(dependency) + ")";
+        String provided = names.isAccessible(dependency.requestedType)
+                ? names.render(boxed(dependency.requestedType))
+                : "Object";
+        // Resolved through the injector on each call, never from a local: a binding made later must be seen.
+        return "new " + names.renderErasure(dependency.declaredType) + "<" + provided + ">() {\n"
+                + "    @Override\n"
+                + "    public " + provided + " get() {\n"
+                + "        return " + resolutionExpression(dependency, Scope.NONE) + ";\n"
+                + "    }\n"
+                + "}";
     }
 
-    private String resolutionExpression(Dependency dependency) {
-        String requested = requestedClassLiteral(dependency);
-        if (dependency.resolved == null) {
-            return "required(" + requested + ", " + CodeWriter.literal(dependency.description) + ", "
-                    + CodeWriter.literal(dependency.unresolvedReason) + ")";
+    /**
+     * The expression resolving a dependency right now: the bean held in a local variable of the current
+     * method, or a call to the getter of the bean or of the type that is not a bean class.
+     */
+    private String resolutionExpression(Dependency dependency, Scope scope) {
+        if (!resolvesToBeanClass(dependency)) {
+            return resolver(dependency).name + "()";
         }
-        String factory = factoryNames.get(dependency.resolved);
-        if (types.isSameType(types.erasure(dependency.requestedType),
-                types.erasure(dependency.resolved.declaredType))) {
-            return factory + "()";
-        }
-        return "dependency(" + requested + ", this::" + factory + ")";
+        String local = scope.locals.get(dependency.resolved);
+        return local != null ? local : getterNames.get(dependency.resolved) + "()";
     }
 
-    private String requestedClassLiteral(Dependency dependency) {
-        TypeMirror requested = dependency.requestedType;
-        if (requested.getKind().isPrimitive()) {
-            requested = types.boxedClass((javax.lang.model.type.PrimitiveType) requested).asType();
+    /**
+     * The getter of a type that is not a bean class states what the type resolves to: the bean implementing
+     * it, or nothing, in which case a test has to bind the type.
+     */
+    private void writeResolver(CodeWriter out, Resolver resolver) {
+        boolean accessible = names.isAccessible(resolver.type);
+        String type = accessible ? names.render(resolver.type) : "Object";
+        String literal = classLiteral(resolver.type);
+        String local = new Scope().declare(localName(types.asElement(types.erasure(resolver.type)) != null
+                ? types.asElement(types.erasure(resolver.type)).getSimpleName().toString()
+                : "value"));
+        String displayName = DependencyResolver.simpleNames(names.describe(resolver.type));
+        if (resolver.bean != null) {
+            out.line("/** {@code " + displayName + "} is implemented by {@link " + typeName(resolver.bean) + "}"
+                    + (accessible ? "" : "; the type itself is not visible from here") + ". */");
+            out.open("public " + type + " " + resolver.name + "() {");
+            out.line(type + " " + local + " = existing(" + literal + ");");
+            out.line("return " + local + " != null ? " + local + " : " + getterNames.get(resolver.bean) + "();");
+            out.close();
+            return;
         }
-        return names.classLiteral(requested);
+        out.line("/** {@code " + displayName + "} has to be bound by the test: " + resolver.reason + ". */");
+        out.open("public " + type + " " + resolver.name + "() {");
+        out.line(type + " " + local + " = existing(" + literal + ");");
+        out.open("if (" + local + " == null) {");
+        out.statement("throw new InjectionException(", "No " + displayName + " was bound, but "
+                + String.join(", ", resolver.injectionPoints) + " needs one: " + resolver.reason
+                + ". Register an instance with Injector.bind("
+                + simpleName(names.describe(types.erasure(resolver.type))) + ".class, ...) first", ");");
+        out.close();
+        out.line("return " + local + ";");
+        out.close();
     }
 
-    private String declareHandle(String baseName, String type, String initializer) {
-        String existing = handleNames.get(initializer);
-        if (existing != null) {
-            return existing;
+    private void writeReflectionHelpers(CodeWriter out) {
+        if (helpers.contains("loadClass")) {
+            out.open("private static Class<?> loadClass(String binaryName) {");
+            out.open("try {");
+            out.line("return Class.forName(binaryName, false, " + CLASS_NAME + ".class.getClassLoader());");
+            out.close("} catch (ClassNotFoundException e) {");
+            out.indent();
+            out.line("throw new InjectionException(\"Class \" + binaryName + \" is not on the class path\", e);");
+            out.close();
+            out.close();
+            out.blank();
         }
-        String name = uniqueName(baseName);
-        handleNames.put(initializer, name);
-        reflectiveHandles.add("private static final " + type + " " + name + " = " + initializer + ";");
-        return name;
+        if (helpers.contains("field")) {
+            String fieldType = jdk("java.lang.reflect.Field");
+            out.open("private static " + fieldType + " field(Class<?> owner, String name) {");
+            out.open("try {");
+            out.line(fieldType + " field = owner.getDeclaredField(name);");
+            out.line("field.setAccessible(true);");
+            out.line("return field;");
+            out.close("} catch (NoSuchFieldException | RuntimeException e) {");
+            out.indent();
+            out.line("throw new InjectionException(\"Cannot access field \" + owner.getName() + \".\" + name, e);");
+            out.close();
+            out.close();
+            out.blank();
+            out.open("private static void set(" + fieldType + " field, Object target, Object value) {");
+            out.open("try {");
+            out.line("field.set(target, value);");
+            out.close("} catch (IllegalAccessException | IllegalArgumentException e) {");
+            out.indent();
+            out.line("throw new InjectionException(\"Cannot inject \" + field.getDeclaringClass().getName() + \".\" +"
+                    + " field.getName(), e);");
+            out.close();
+            out.close();
+            out.blank();
+        }
+        if (helpers.contains("method")) {
+            String methodType = jdk("java.lang.reflect.Method");
+            out.open("private static " + methodType + " method(Class<?> owner, String name, Class<?>..."
+                    + " parameterTypes) {");
+            out.open("try {");
+            out.line(methodType + " method = owner.getDeclaredMethod(name, parameterTypes);");
+            out.line("method.setAccessible(true);");
+            out.line("return method;");
+            out.close("} catch (NoSuchMethodException | RuntimeException e) {");
+            out.indent();
+            out.line("throw new InjectionException(\"Cannot access method \" + owner.getName() + \".\" + name, e);");
+            out.close();
+            out.close();
+            out.blank();
+            out.open("private static Object invoke(" + methodType + " method, Object target, Object... arguments) {");
+            out.open("try {");
+            out.line("return method.invoke(target, arguments);");
+            out.close("} catch (IllegalAccessException | IllegalArgumentException e) {");
+            out.indent();
+            out.line("throw new InjectionException(\"Cannot invoke \" + method.getDeclaringClass().getName() + \".\" +"
+                    + " method.getName(), e);");
+            out.close("} catch (" + jdk("java.lang.reflect.InvocationTargetException") + " e) {");
+            out.indent();
+            out.line("throw unwrap(e);");
+            out.close();
+            out.close();
+            out.blank();
+        }
+        if (helpers.contains("constructor")) {
+            String constructorType = jdk("java.lang.reflect.Constructor");
+            out.open("private static <T> " + constructorType + "<T> constructor(Class<T> owner, Class<?>..."
+                    + " parameterTypes) {");
+            out.open("try {");
+            out.line(constructorType + "<T> constructor = owner.getDeclaredConstructor(parameterTypes);");
+            out.line("constructor.setAccessible(true);");
+            out.line("return constructor;");
+            out.close("} catch (NoSuchMethodException | RuntimeException e) {");
+            out.indent();
+            out.line("throw new InjectionException(\"Cannot access constructor of \" + owner.getName(), e);");
+            out.close();
+            out.close();
+            out.blank();
+            out.open("private static <T> T newInstance(" + constructorType + "<T> constructor, Object... arguments) {");
+            out.open("try {");
+            out.line("return constructor.newInstance(arguments);");
+            out.close("} catch (InstantiationException | IllegalAccessException | IllegalArgumentException e) {");
+            out.indent();
+            out.line("throw new InjectionException(\"Cannot instantiate \" + constructor.getDeclaringClass().getName(),"
+                    + " e);");
+            out.close("} catch (" + jdk("java.lang.reflect.InvocationTargetException") + " e) {");
+            out.indent();
+            out.line("throw unwrap(e);");
+            out.close();
+            out.close();
+            out.blank();
+        }
+        if (helpers.contains("method") || helpers.contains("constructor")) {
+            out.line("/** Rethrows what user code threw, so that test assertions see the original exception. */");
+            out.open("private static RuntimeException unwrap(" + jdk("java.lang.reflect.InvocationTargetException")
+                    + " e) {");
+            out.line("Throwable cause = e.getCause();");
+            out.open("if (cause instanceof RuntimeException) {");
+            out.line("return (RuntimeException) cause;");
+            out.close();
+            out.open("if (cause instanceof Error) {");
+            out.line("throw (Error) cause;");
+            out.close();
+            out.line("return new InjectionException(cause.getMessage(), cause);");
+            out.close();
+            out.blank();
+        }
+    }
+
+    /** The erasure of the bean's class as source, e.g. {@code OrderService}. */
+    private String typeName(BeanModel bean) {
+        return names.render(types.erasure(bean.declaredType));
+    }
+
+    /** A class literal, or a {@code loadClass} call for a class the generated code cannot name. */
+    private String classLiteral(TypeMirror type) {
+        String literal = names.classLiteral(type);
+        if (literal.startsWith("loadClass(")) {
+            helpers.add("loadClass");
+        }
+        return literal;
     }
 
     private String classLiteral(TypeElement type) {
-        return names.classLiteral(type.asType());
+        return classLiteral(type.asType());
     }
 
-    private String identifier(TypeElement type) {
-        return elements.getBinaryName(type).toString().replace('.', '_');
+    /** An import marker for a JDK class the infrastructure uses. */
+    private String jdk(String qualifiedName) {
+        return Imports.reference(elements.getTypeElement(qualifiedName));
     }
 
     private String uniqueName(String base) {
@@ -580,100 +883,191 @@ final class InjectorGenerator {
         return qualifiedName.substring(qualifiedName.lastIndexOf('.') + 1);
     }
 
-    private void writeReflectionHelpers(CodeWriter out) {
-        out.open("private static Class<?> loadClass(String binaryName) {");
-        out.open("try {");
-        out.line("return Class.forName(binaryName, false, " + CLASS_NAME + ".class.getClassLoader());");
-        out.close("} catch (ClassNotFoundException e) {");
-        out.indent();
-        out.line("throw new InjectionException(\"Class \" + binaryName + \" is not on the class path\", e);");
-        out.close();
-        out.close();
-        out.blank();
-        out.open("private static java.lang.reflect.Field field(Class<?> owner, String name) {");
-        out.open("try {");
-        out.line("java.lang.reflect.Field field = owner.getDeclaredField(name);");
-        out.line("field.setAccessible(true);");
-        out.line("return field;");
-        out.close("} catch (NoSuchFieldException | RuntimeException e) {");
-        out.indent();
-        out.line("throw new InjectionException(\"Cannot access field \" + owner.getName() + \".\" + name, e);");
-        out.close();
-        out.close();
-        out.blank();
-        out.open("private static java.lang.reflect.Method method(Class<?> owner, String name, Class<?>..."
-                + " parameterTypes) {");
-        out.open("try {");
-        out.line("java.lang.reflect.Method method = owner.getDeclaredMethod(name, parameterTypes);");
-        out.line("method.setAccessible(true);");
-        out.line("return method;");
-        out.close("} catch (NoSuchMethodException | RuntimeException e) {");
-        out.indent();
-        out.line("throw new InjectionException(\"Cannot access method \" + owner.getName() + \".\" + name, e);");
-        out.close();
-        out.close();
-        out.blank();
-        out.open("private static java.lang.reflect.Constructor<?> constructor(Class<?> owner, Class<?>..."
-                + " parameterTypes) {");
-        out.open("try {");
-        out.line("java.lang.reflect.Constructor<?> constructor = owner.getDeclaredConstructor(parameterTypes);");
-        out.line("constructor.setAccessible(true);");
-        out.line("return constructor;");
-        out.close("} catch (NoSuchMethodException | RuntimeException e) {");
-        out.indent();
-        out.line("throw new InjectionException(\"Cannot access constructor of \" + owner.getName(), e);");
-        out.close();
-        out.close();
-        out.blank();
-        out.open("private static void set(java.lang.reflect.Field field, Object target, Object value) {");
-        out.open("try {");
-        out.line("field.set(target, value);");
-        out.close("} catch (IllegalAccessException | IllegalArgumentException e) {");
-        out.indent();
-        out.line("throw new InjectionException(\"Cannot inject \" + field.getDeclaringClass().getName() + \".\" +"
-                + " field.getName(), e);");
-        out.close();
-        out.close();
-        out.blank();
-        out.open("private static Object invoke(java.lang.reflect.Method method, Object target, Object... arguments) {");
-        out.open("try {");
-        out.line("return method.invoke(target, arguments);");
-        out.close("} catch (IllegalAccessException | IllegalArgumentException e) {");
-        out.indent();
-        out.line("throw new InjectionException(\"Cannot invoke \" + method.getDeclaringClass().getName() + \".\" +"
-                + " method.getName(), e);");
-        out.close("} catch (java.lang.reflect.InvocationTargetException e) {");
-        out.indent();
-        out.line("throw unwrap(e);");
-        out.close();
-        out.close();
-        out.blank();
-        out.open("private static Object newInstance(java.lang.reflect.Constructor<?> constructor, Object... arguments)"
-                + " {");
-        out.open("try {");
-        out.line("return constructor.newInstance(arguments);");
-        out.close("} catch (InstantiationException | IllegalAccessException | IllegalArgumentException e) {");
-        out.indent();
-        out.line("throw new InjectionException(\"Cannot instantiate \" + constructor.getDeclaringClass().getName(),"
-                + " e);");
-        out.close("} catch (java.lang.reflect.InvocationTargetException e) {");
-        out.indent();
-        out.line("throw unwrap(e);");
-        out.close();
-        out.close();
-        out.blank();
-        out.line("/** Rethrows what user code threw, so that test assertions see the original exception. */");
-        out.open("private static RuntimeException unwrap(java.lang.reflect.InvocationTargetException e) {");
-        out.line("Throwable cause = e.getCause();");
-        out.open("if (cause instanceof RuntimeException) {");
-        out.line("return (RuntimeException) cause;");
-        out.close();
-        out.open("if (cause instanceof Error) {");
-        out.line("throw (Error) cause;");
-        out.close();
-        out.line("return new InjectionException(cause.getMessage(), cause);");
-        out.close();
-        out.blank();
+    private static String decapitalize(String name) {
+        if (name.length() > 1 && Character.isUpperCase(name.charAt(1))) {
+            return name;
+        }
+        return Character.toLowerCase(name.charAt(0)) + name.substring(1);
+    }
+
+    private static String capitalize(String name) {
+        return Character.toUpperCase(name.charAt(0)) + name.substring(1);
+    }
+
+    /**
+     * The local variable name for an instance of the class: its last camel-case word ({@code service} for
+     * {@code OrderService}), unless that is a keyword or the name of a method of the generated class.
+     */
+    private static String localName(String simpleName) {
+        int start = simpleName.length() - 1;
+        while (start > 0 && !(Character.isUpperCase(simpleName.charAt(start))
+                && !Character.isUpperCase(simpleName.charAt(start - 1)))) {
+            start--;
+        }
+        String word = decapitalize(simpleName.substring(start));
+        return SourceVersion.isName(word) && !METHODS.contains(word) ? word : decapitalize(simpleName);
+    }
+
+    /** Local names for the members of a group; members whose last word would clash use their full names. */
+    private static Map<BeanModel, String> localNames(List<BeanModel> members) {
+        Map<String, Integer> counts = new HashMap<>();
+        for (BeanModel member : members) {
+            String name = localName(member.type.getSimpleName().toString());
+            counts.put(name, counts.getOrDefault(name, 0) + 1);
+        }
+        Map<BeanModel, String> locals = new LinkedHashMap<>();
+        for (BeanModel member : members) {
+            String simple = member.type.getSimpleName().toString();
+            String name = localName(simple);
+            locals.put(member, counts.get(name) == 1 ? name : decapitalize(simple));
+        }
+        return locals;
+    }
+
+    /** The local variables of one generated method. */
+    private static final class Scope {
+
+        /** The scope of code that must resolve through the injector, holding no bean in a local. */
+        static final Scope NONE = new Scope();
+
+        private final Set<String> used = new HashSet<>(FIELDS);
+        /** Beans held in a local variable of the method: the bean being created, or the members of a group. */
+        final Map<BeanModel, String> locals = new HashMap<>();
+
+        String declare(String base) {
+            String name = SourceVersion.isName(base) ? base : base + "_";
+            for (int i = 2; !used.add(name); i++) {
+                name = base + i;
+            }
+            return name;
+        }
+    }
+
+    /** A dependency type that is not a bean class, and what it resolves to. */
+    private final class Resolver {
+
+        final TypeMirror type;
+        /** The bean implementing the type, or null if a test has to bind it. */
+        final BeanModel bean;
+        /** Why nothing was resolved, if {@link #bean} is null. */
+        final String reason;
+        final Set<String> injectionPoints = new LinkedHashSet<>();
+        final String name;
+
+        Resolver(TypeMirror type, Dependency first) {
+            this.type = type;
+            this.bean = first.resolved;
+            this.reason = first.unresolvedReason;
+            this.injectionPoints.add(shortDescription(first));
+            this.name = uniqueName("get" + capitalize(methodName(type)));
+        }
+
+        /** {@code repository} for {@code Repository}, {@code repositoryOfUser} for {@code Repository<User>}. */
+        private String methodName(TypeMirror type) {
+            String rendered = names.describe(type);
+            StringBuilder name = new StringBuilder();
+            for (String part : rendered.split("[<>,\\s]+")) {
+                if (part.isEmpty()) {
+                    continue;
+                }
+                String simple = part.substring(part.lastIndexOf('.') + 1).replace("?", "Any").replace("[]", "Array");
+                if (name.length() == 0) {
+                    name.append(decapitalize(simple));
+                } else {
+                    name.append("Of").append(capitalize(simple));
+                }
+            }
+            String result = name.toString().replaceAll("[^A-Za-z0-9_$]", "");
+            return SourceVersion.isName(result) ? result : result + "Type";
+        }
+    }
+
+    /** Beans that depend on each other and are therefore created together, see {@link #writeGroup}. */
+    private final class CycleGroup {
+
+        final String name;
+        /** The members in creation order: a bean after every bean it takes as a constructor argument. */
+        final List<BeanModel> members;
+        /** The members in the order their callbacks run: dependencies first, as far as a cycle allows. */
+        final List<BeanModel> callbackOrder;
+
+        CycleGroup(List<BeanModel> component, Map<BeanModel, List<BeanModel>> edges,
+                Map<BeanModel, List<BeanModel>> constructorEdges) {
+            this.members = creationOrder(component, constructorEdges);
+            this.callbackOrder = new ArrayList<>();
+            visitDependenciesFirst(members.get(0), edges, new HashSet<>(), callbackOrder);
+            StringBuilder name = new StringBuilder("create");
+            for (BeanModel member : members) {
+                name.append(member.type.getSimpleName());
+            }
+            this.name = uniqueName(name.toString());
+        }
+
+        /** The members as {@code {@link A}, {@link B} and {@link C}}. */
+        String describe() {
+            return describe(members);
+        }
+
+        private String describe(List<BeanModel> beans) {
+            StringBuilder description = new StringBuilder();
+            for (int i = 0; i < beans.size(); i++) {
+                if (i > 0) {
+                    description.append(i == beans.size() - 1 ? " and " : ", ");
+                }
+                description.append("{@link ").append(typeName(beans.get(i))).append('}');
+            }
+            return description.toString();
+        }
+
+        /** The members other than {@code bean}, as {@link #describe()}. */
+        String describeOthers(BeanModel bean) {
+            List<BeanModel> others = new ArrayList<>(members);
+            others.remove(bean);
+            return describe(others);
+        }
+
+        /** Topological order by the constructor edges within the component, ties broken by bean order. */
+        private List<BeanModel> creationOrder(List<BeanModel> component,
+                Map<BeanModel, List<BeanModel>> constructorEdges) {
+            List<BeanModel> order = new ArrayList<>();
+            Set<BeanModel> remaining = new LinkedHashSet<>(component);
+            while (!remaining.isEmpty()) {
+                BeanModel next = null;
+                for (BeanModel candidate : remaining) {
+                    boolean ready = true;
+                    for (BeanModel argument : constructorEdges.get(candidate)) {
+                        if (argument != candidate && remaining.contains(argument)) {
+                            ready = false;
+                        }
+                    }
+                    if (ready) {
+                        next = candidate;
+                        break;
+                    }
+                }
+                if (next == null) {
+                    // A constructor-only cycle; reported as an error elsewhere, so any order will do.
+                    next = remaining.iterator().next();
+                }
+                remaining.remove(next);
+                order.add(next);
+            }
+            return order;
+        }
+
+        /** Depth-first post-order over the edges within the component, starting from {@code bean}. */
+        private void visitDependenciesFirst(BeanModel bean, Map<BeanModel, List<BeanModel>> edges,
+                Set<BeanModel> visited, List<BeanModel> order) {
+            if (!visited.add(bean)) {
+                return;
+            }
+            for (BeanModel dependency : edges.get(bean)) {
+                if (members.contains(dependency)) {
+                    visitDependenciesFirst(dependency, edges, visited, order);
+                }
+            }
+            order.add(bean);
+        }
     }
 
     private void writeExceptionClass(CodeWriter out) {

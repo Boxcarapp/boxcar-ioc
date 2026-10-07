@@ -33,7 +33,7 @@ import com.boxcar.ioc.processor.BeanModel.FieldInjection;
 import com.boxcar.ioc.processor.BeanModel.MethodInjection;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
+import java.util.StringJoiner;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.ElementKind;
 import javax.lang.model.element.ExecutableElement;
@@ -81,8 +81,7 @@ final class BeanScanner {
                 if (member instanceof VariableElement field && containsErrorType(field.asType())) {
                     return true;
                 }
-                if (member instanceof ExecutableElement executable
-                        && executable.getParameters().stream().anyMatch(p -> containsErrorType(p.asType()))) {
+                if (member instanceof ExecutableElement executable && anyParameterContainsErrorType(executable)) {
                     return true;
                 }
             }
@@ -147,9 +146,12 @@ final class BeanScanner {
 
     private Constructor findConstructor(BeanModel bean) {
         List<ExecutableElement> constructors = ElementFilter.constructorsIn(bean.type.getEnclosedElements());
-        List<ExecutableElement> injectable = constructors.stream()
-                .filter(c -> Annotations.isAnnotated(c, Annotations.CONSTRUCTOR_INJECT))
-                .toList();
+        List<ExecutableElement> injectable = new ArrayList<>();
+        for (ExecutableElement constructor : constructors) {
+            if (Annotations.isAnnotated(constructor, Annotations.CONSTRUCTOR_INJECT)) {
+                injectable.add(constructor);
+            }
+        }
         if (injectable.size() > 1) {
             diagnostics.error(bean.type, "Bean class " + bean.qualifiedName
                     + " has " + injectable.size() + " @Inject constructors; at most one is allowed");
@@ -260,13 +262,19 @@ final class BeanScanner {
     }
 
     private void scanPostConstruct(BeanModel bean, TypeElement owner, List<TypeElement> subclasses) {
-        List<ExecutableElement> callbacks = ElementFilter.methodsIn(owner.getEnclosedElements()).stream()
-                .filter(m -> Annotations.isAnnotated(m, Annotations.POST_CONSTRUCT))
-                .toList();
+        List<ExecutableElement> callbacks = new ArrayList<>();
+        for (ExecutableElement method : ElementFilter.methodsIn(owner.getEnclosedElements())) {
+            if (Annotations.isAnnotated(method, Annotations.POST_CONSTRUCT)) {
+                callbacks.add(method);
+            }
+        }
         if (callbacks.size() > 1) {
+            StringJoiner callbackNames = new StringJoiner(", ");
+            for (ExecutableElement callback : callbacks) {
+                callbackNames.add(callback.getSimpleName().toString());
+            }
             diagnostics.error(owner, "Class " + owner.getQualifiedName() + " declares " + callbacks.size()
-                    + " @PostConstruct methods (" + callbacks.stream().map(m -> m.getSimpleName().toString())
-                    .collect(Collectors.joining(", ")) + "); at most one is allowed per class");
+                    + " @PostConstruct methods (" + callbackNames + "); at most one is allowed per class");
             return;
         }
         for (ExecutableElement callback : callbacks) {
@@ -311,11 +319,20 @@ final class BeanScanner {
         return qualifiedName.substring(qualifiedName.lastIndexOf('.') + 1);
     }
 
+    private boolean anyParameterContainsErrorType(ExecutableElement executable) {
+        for (VariableElement parameter : executable.getParameters()) {
+            if (containsErrorType(parameter.asType())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /** Whether any part of {@code type} failed to resolve, in which case processing must be deferred. */
     private boolean containsErrorType(TypeMirror type) {
         return switch (type.getKind()) {
           case ERROR -> true;
-          case DECLARED -> ((DeclaredType) type).getTypeArguments().stream().anyMatch(this::containsErrorType);
+          case DECLARED -> anyContainsErrorType(((DeclaredType) type).getTypeArguments());
           case ARRAY -> containsErrorType(((ArrayType) type).getComponentType());
           case WILDCARD -> {
               WildcardType wildcard = (WildcardType) type;
@@ -326,5 +343,14 @@ final class BeanScanner {
           }
           default -> false;
         };
+    }
+
+    private boolean anyContainsErrorType(List<? extends TypeMirror> types) {
+        for (TypeMirror type : types) {
+            if (containsErrorType(type)) {
+                return true;
+            }
+        }
+        return false;
     }
 }

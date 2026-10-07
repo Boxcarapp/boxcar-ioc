@@ -7,21 +7,40 @@ the other, [`boxcar-ioc-reflection`](../boxcar-ioc-reflection/README.md), does t
 work with reflection at runtime. Both pass the shared [TCK](../boxcar-ioc-tck/README.md).
 
 At compile time the processor finds every bean class, resolves each `@Inject` point to the bean that
-satisfies it, detects dependency cycles, and emits a single class:
+satisfies it, detects dependency cycles, and emits a single class, `com.boxcar.Injector`, with two
+ways in.
+
+**A typed getter per type**, which is where the wiring is:
 
 ```java
-package com.boxcar;
-
-public class Injector {
-    public Injector() { ... }
-    public <T> T getInstance(Class<T> type) { ... }
-    public <T> Injector bind(Class<T> type, T instance) { ... }
-    public <T> Injector bind(Class<T> type, Class<? extends T> implementation) { ... }
-    public static final class InjectionException extends RuntimeException { ... }
-}
+public OrderService getOrderService();
+public OrderRepository getOrderRepository();   // an interface: resolves to its one implementation
+public PaymentGateway getPaymentGateway();     // no bean provides it: must be bound by the test
 ```
 
-Nothing is scanned at runtime and the generated class depends on the JDK only.
+A bean's getter attempts to approximate the way the wiring would be written by hand — `new OrderService(getOrderRepository(), ...)`,
+the instance stored in a `Map<Class<?>, Object>`, fields and setters injected, `@PostConstruct` called —
+and the compiler checks the type. Reading `getOrderService()` tells you exactly how an `OrderService`
+comes to be, with no indirection.
+
+**The API shared with the reflection implementation**, for projects that want to stay source-compatible
+with it:
+
+```java
+public <T> T getInstance(Class<T> type);
+public <T> Injector bind(Class<T> type, T instance);
+public <T> Injector bind(Class<T> type, Class<? extends T> implementation);
+public static final class InjectionException extends RuntimeException;
+```
+
+Java's erasure rules do not allow `getInstance(Class<OrderService>)` and `getInstance(Class<T>)` to
+coexist, so `getInstance` is a dispatcher — `if (type == OrderService.class) return getOrderService();`
+for each known type, then the bound types — and nothing more. Using the typed getters is the thinner
+call chain, at the price that moving the project back to the reflection implementation means
+changing `getOrderService()` calls to `getInstance(OrderService.class)`.
+
+Nothing is scanned or looked up in tables at runtime; the only runtime state is the instance map and
+what `bind` registered. The generated class depends on the JDK only.
 
 ## Usage
 
@@ -31,7 +50,7 @@ void placesOrders() {
     Injector injector = new Injector()
             .bind(PaymentGateway.class, amount -> true);   // container-provided in production
 
-    OrderService orders = injector.getInstance(OrderService.class);
+    OrderService orders = injector.getOrderService();   // or injector.getInstance(OrderService.class)
 
     assertTrue(orders.placeOrder("book", new BigDecimal("10.00")));
 }
@@ -131,7 +150,7 @@ Annotations are matched by name; both `jakarta.*` and the legacy `javax.*` names
 | Bean-defining (class) | `@jakarta.inject.Singleton`, `@jakarta.ejb.Singleton`, `@jakarta.ejb.Stateless`, `@jakarta.ejb.Stateful`, `@jakarta.enterprise.context.ApplicationScoped` | One shared instance per `Injector`, regardless of the annotation. |
 | Injection point | `@jakarta.inject.Inject` on constructors, fields and methods; `@jakarta.ejb.EJB` on fields and setter methods | Constructor first, then fields, then methods; superclass members before subclass members. |
 | Lazy dependency | `jakarta.inject.Provider<T>` | `get()` resolves through the injector on each call; breaks constructor cycles. |
-| Lifecycle | `@jakarta.annotation.PostConstruct` | Invoked once the outermost `getInstance` call has wired everything, dependencies first. |
+| Lifecycle | `@jakarta.annotation.PostConstruct` | Invoked once the bean and its dependencies are wired, dependencies first; in a cycle, once the whole cycle is wired. |
 
 Bean classes must be concrete, public (including enclosing classes), static if nested, in a named
 package, and have either one `@Inject` constructor or a no-argument constructor of any visibility.
@@ -169,19 +188,98 @@ bean of exactly that type), or any type passed to `bind`.
 
 ## Cycles
 
-Instances are registered before their fields and methods are injected, so a cycle simply finds the
-partially initialised instance and is closed by field or method injection after both objects exist.
-Constructor arguments are resolved before construction, and the injector re-checks its map
-afterwards because resolving them may already have created the bean through such a mixed cycle.
+The generated code is shaped by the dependency graph. A bean that is not on a cycle gets a getter
+that constructs it with its dependencies as constructor arguments (each a call to the dependency's
+own getter), stores it in the injector's `Map<Class<?>, Object>`, injects its fields and methods and
+runs its `@PostConstruct` callbacks. If any of that can fail — a dependency a test forgot to bind, an
+exception from bean code — the getter discards what it added, so that the test can bind and call
+again:
+
+```java
+public PricingService getPricingService() {
+    PricingService service = existing(PricingService.class);
+    if (service != null) {
+        return service;
+    }
+    Set<Class<?>> before = new HashSet<>(instances.keySet());
+    try {
+        service = new PricingService();
+        instances.put(PricingService.class, service);
+        service.taxCalculator = getTaxCalculator();
+        invoke(method(PricingService.class, "init"), service);
+        return service;
+    } catch (RuntimeException | Error e) {
+        instances.keySet().retainAll(before);
+        throw e;
+    }
+}
+```
+
+A dependency whose type is not a bean class — an interface, or a type no bean provides — has a getter
+too, stating what the processor found:
+
+```java
+/** {@code OrderRepository} is implemented by {@link InMemoryOrderRepository}. */
+public OrderRepository getOrderRepository() {
+    OrderRepository repository = existing(OrderRepository.class);
+    return repository != null ? repository : getInMemoryOrderRepository();
+}
+
+/** {@code PaymentGateway} has to be bound by the test: no bean of type PaymentGateway is known. */
+public PaymentGateway getPaymentGateway() {
+    PaymentGateway gateway = existing(PaymentGateway.class);
+    if (gateway == null) {
+        throw new InjectionException("No PaymentGateway was bound, but OrderService.paymentGateway needs one: ...");
+    }
+    return gateway;
+}
+```
+
+Beans that depend on each other are created by one method for the whole group. Every instance is
+constructed first, in an order that satisfies the constructor dependencies among them, and only then
+are they injected into each other, so the cycle is closed by field and method injection once all of
+them exist. Their callbacks run after all of the injection, dependencies first as far as the cycle
+allows. Each member's getter delegates to that method:
+
+```java
+private void createDeltaGamma() {
+    Set<Class<?>> before = new HashSet<>(instances.keySet());
+    try {
+        Delta delta = existing(Delta.class);
+        boolean newDelta = delta == null;
+        if (newDelta) {
+            delta = new Delta();
+            instances.put(Delta.class, delta);
+        }
+        Gamma gamma = existing(Gamma.class);
+        if (gamma == null) {
+            gamma = new Gamma(delta);
+            instances.put(Gamma.class, gamma);
+        }
+        if (newDelta) {
+            set(field(Delta.class, "gamma"), delta, gamma);
+        }
+    } catch (RuntimeException | Error e) {
+        instances.keySet().retainAll(before);
+        throw e;
+    }
+}
+```
+
+`existing(...)` is the one runtime lookup: the instance already created for the type, or the one a
+test bound for it. A member of a cycle whose class a test has bound (to a mock, say) is therefore
+used as bound and neither injected nor initialised.
 
 The processor runs a depth-first search over the dependency graph:
 
 * A cycle that runs only through constructor parameters can never be created and is a **compile
   error**. Inject one side as a field, a method parameter, or a `Provider<T>`.
-* Every other cycle is reported as a *note* and resolved lazily as described above.
+* Every other cycle is reported as a *note* and closed after construction as described above.
 
-Because `@PostConstruct` callbacks run after the whole graph is wired, they see fully injected
-dependencies even inside cycles.
+Because a `@PostConstruct` callback runs only after the bean's dependencies are wired — and in a
+cycle only after the whole cycle is — it sees fully injected dependencies even inside cycles.
+Cycles that exist only at runtime, because `bind(type, implementation)` chose a bean the processor
+did not resolve the type to, are not analysed; one that runs through constructors cannot be created.
 
 ## Not supported
 

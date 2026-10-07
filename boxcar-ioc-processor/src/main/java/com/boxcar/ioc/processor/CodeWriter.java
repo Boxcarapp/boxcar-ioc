@@ -26,6 +26,9 @@ package com.boxcar.ioc.processor;
  * #L%
  */
 
+import java.util.ArrayList;
+import java.util.List;
+
 /** Minimal indentation-aware source writer. */
 final class CodeWriter {
 
@@ -39,6 +42,14 @@ final class CodeWriter {
             out.append(INDENT.repeat(depth));
         }
         out.append(text).append('\n');
+        return this;
+    }
+
+    /** Writes a statement that may span several lines, such as one containing an anonymous class. */
+    CodeWriter lines(String text) {
+        for (String line : text.split("\n", -1)) {
+            line(line);
+        }
         return this;
     }
 
@@ -66,6 +77,37 @@ final class CodeWriter {
     /** Appends already formatted text verbatim. */
     CodeWriter raw(String text) {
         out.append(text);
+        return this;
+    }
+
+    /**
+     * Writes a statement ending in a string literal, wrapped over continuation lines at word boundaries
+     * the way a person would break a long message: {@code prefix + "text..."} then {@code + " ...text" + suffix}.
+     */
+    CodeWriter statement(String prefix, String text, String suffix) {
+        int available = 110 - INDENT.length() * depth;
+        List<String> parts = new ArrayList<>();
+        int start = 0;
+        int width = available - prefix.length() - 2;
+        while (text.length() - start > width) {
+            int end = text.lastIndexOf(' ', start + width);
+            if (end <= start) {
+                end = Math.min(text.length(), start + width);
+            }
+            parts.add(text.substring(start, end));
+            start = end;
+            width = available - INDENT.length() * 2 - 4;
+        }
+        parts.add(text.substring(start));
+        for (int i = 0; i < parts.size(); i++) {
+            String literal = literal(parts.get(i));
+            String tail = i == parts.size() - 1 ? suffix : "";
+            if (i == 0) {
+                line(prefix + literal + tail);
+            } else {
+                line(INDENT + INDENT + "+ " + literal + tail);
+            }
+        }
         return this;
     }
 

@@ -109,7 +109,199 @@ class InjectorProcessorTest {
 
         assertTrue(result.success(), result.diagnostics().toString());
         assertTrue(result.ofKind(Kind.ERROR).isEmpty());
-        assertTrue(result.hasMessage(Kind.NOTE, "resolved lazily"), result.messages(Kind.NOTE).toString());
+        assertTrue(result.hasMessage(Kind.NOTE, "closed after construction"), result.messages(Kind.NOTE).toString());
+    }
+
+    @Test
+    void cycleMembersAreConstructedBeforeAnyIsInjectedAndInjectedBeforeAnyCallback() throws IOException {
+        Compilation.Result result = Compilation.withProcessor(workDir, Map.of(
+                "app.A", """
+                        package app;
+                        @jakarta.ejb.Stateless
+                        public class A {
+                            @jakarta.inject.Inject public B b;
+                            @jakarta.annotation.PostConstruct public void init() {}
+                        }
+                        """,
+                "app.B", """
+                        package app;
+                        @jakarta.ejb.Stateless
+                        public class B {
+                            @jakarta.inject.Inject public void setA(A a) {}
+                            @jakarta.annotation.PostConstruct public void init() {}
+                        }
+                        """,
+                "app.C", """
+                        package app;
+                        @jakarta.ejb.Stateless
+                        public class C {
+                            @jakarta.inject.Inject public C(A a) {}
+                        }
+                        """));
+
+        assertTrue(result.success(), result.diagnostics().toString());
+        String injector = result.generatedInjector();
+        // Members: both constructed and stored, then injected into each other, then the callbacks: B first,
+        // because A depends on it.
+        assertInOrder(injector,
+                "private void createAB() {",
+                "A a = existing(A.class);",
+                "boolean newA = a == null;",
+                "a = new A();",
+                "instances.put(A.class, a);",
+                "B b = existing(B.class);",
+                "b = new B();",
+                "instances.put(B.class, b);",
+                "if (newA) {",
+                "a.b = b;",
+                "if (newB) {",
+                "b.setA(a);",
+                "if (newB) {",
+                "b.init();",
+                "if (newA) {",
+                "a.init();");
+        // Each member's factory delegates to the group.
+        assertInOrder(injector,
+                "public A getA() {",
+                "A a = existing(A.class);",
+                "createAB();",
+                "a = (A) instances.get(A.class);");
+        // A bean outside the cycle simply calls the factory of what it depends on.
+        assertTrue(injector.contains("c = new C(getA());"), injector);
+    }
+
+    @Test
+    void mixedConstructorAndFieldCycleConstructsTheConstructorDependencyFirst() throws IOException {
+        Compilation.Result result = Compilation.withProcessor(workDir, Map.of(
+                "app.Gamma", """
+                        package app;
+                        @jakarta.ejb.Stateless
+                        public class Gamma {
+                            @jakarta.inject.Inject public Gamma(Delta delta) {}
+                        }
+                        """,
+                "app.Delta", """
+                        package app;
+                        @jakarta.ejb.Stateless
+                        public class Delta {
+                            @jakarta.inject.Inject public Gamma gamma;
+                        }
+                        """));
+
+        assertTrue(result.success(), result.diagnostics().toString());
+        assertInOrder(result.generatedInjector(),
+                "private void createDeltaGamma() {",
+                "delta = new Delta();",
+                "gamma = new Gamma(delta);",
+                "delta.gamma = gamma;");
+    }
+
+    @Test
+    void acyclicBeansUseConstructorInjectionWithoutAnyCycleMachinery() throws IOException {
+        Compilation.Result result = Compilation.withProcessor(workDir, Map.of(
+                "app.Config", """
+                        package app;
+                        @jakarta.inject.Singleton
+                        public class Config {}
+                        """,
+                "app.Service", """
+                        package app;
+                        @jakarta.ejb.Stateless
+                        public class Service {
+                            @jakarta.inject.Inject
+                            public Service(Config config, jakarta.inject.Provider<Config> lazy) {}
+                            @jakarta.inject.Inject public Config self;
+                        }
+                        """));
+
+        assertTrue(result.success(), result.diagnostics().toString());
+        String injector = result.generatedInjector();
+        assertInOrder(injector,
+                "import app.Config;",
+                "import app.Service;",
+                "import jakarta.inject.Provider;",
+                "public Service getService() {",
+                "Service service = existing(Service.class);",
+                "if (service != null) {",
+                "return service;",
+                "service = new Service(getConfig(), new Provider<Config>() {",
+                "public Config get() {",
+                "return getConfig();",
+                "});",
+                "instances.put(Service.class, service);",
+                "service.self = getConfig();",
+                "return service;");
+        assertFalse(injector.contains("create" + "Config"), "no group method for acyclic beans");
+    }
+
+    @Test
+    void interfaceAndUnboundDependenciesGetResolverMethodsAndLookupIsStatic() throws IOException {
+        Compilation.Result result = Compilation.withProcessor(workDir, Map.of(
+                "app.Repo", """
+                        package app;
+                        public interface Repo {}
+                        """,
+                "app.JpaRepo", """
+                        package app;
+                        @jakarta.ejb.Stateless
+                        public class JpaRepo implements Repo {}
+                        """,
+                "app.Service", """
+                        package app;
+                        @jakarta.ejb.Stateless
+                        public class Service {
+                            @jakarta.inject.Inject public Repo repo;
+                            @jakarta.inject.Inject public java.time.Clock clock;
+                        }
+                        """,
+                "app.Other", """
+                        package app;
+                        @jakarta.ejb.Stateless
+                        public class Other {
+                            @jakarta.inject.Inject public java.time.Clock clock;
+                        }
+                        """));
+
+        assertTrue(result.success(), result.diagnostics().toString());
+        String injector = result.generatedInjector();
+        // The interface resolves to its implementation unless the test bound something for it.
+        assertInOrder(injector,
+                "/** {@code Repo} is implemented by {@link JpaRepo}. */",
+                "public Repo getRepo() {",
+                "Repo repo = existing(Repo.class);",
+                "return repo != null ? repo : getJpaRepo();");
+        // A type without a bean has one resolver naming every injection point that needs it.
+        assertInOrder(injector,
+                "public Clock getClock() {",
+                "Clock clock = existing(Clock.class);",
+                "if (clock == null) {",
+                "throw new InjectionException(\"No Clock was bound, but Other.clock, Service.clock needs one",
+                "Injector.bind(Clock.class,",
+                "...) first\");");
+        assertTrue(injector.contains("service.repo = getRepo();"), injector);
+        assertTrue(injector.contains("service.clock = getClock();"), injector);
+        // getInstance dispatches straight to the getters of the types known at compile time, and nothing else.
+        assertInOrder(injector,
+                "public <T> T getInstance(Class<T> type) {",
+                "if (type == JpaRepo.class) {",
+                "return type.cast(getJpaRepo());",
+                "if (type == Repo.class) {",
+                "return type.cast(getRepo());",
+                "T bound = existing(Objects.requireNonNull(type, \"type\"));",
+                "throw new InjectionException(\"No bean of type \" + type.getName()");
+        assertFalse(injector.contains("lookup("), "no dispatch layer between getInstance and the getters");
+        assertFalse(injector.contains("Map<Class<?>, Class<?>> BINDINGS"), "no runtime lookup table");
+        assertFalse(injector.contains("if (type == Clock.class)"), "an unbound type is only reachable through bind");
+    }
+
+    /** Asserts that the fragments occur in {@code text} in the given order, each after the previous one. */
+    private static void assertInOrder(String text, String... fragments) {
+        int from = 0;
+        for (String fragment : fragments) {
+            int index = text.indexOf(fragment, from);
+            assertTrue(index >= 0, "expected \"" + fragment + "\" after position " + from + " in:\n" + text);
+            from = index + fragment.length();
+        }
     }
 
     @Test
@@ -256,10 +448,56 @@ class InjectorProcessorTest {
         // unbound.
         String injector = result.generatedInjector();
         assertNotNull(injector);
-        assertTrue(injector.contains("required(java.util.logging.Logger.class, \"app.Bean.logger\","
-                + " \"no bean of type java.util.logging.Logger is known\")"), injector);
-        assertTrue(injector.contains("(jakarta.inject.Provider<java.lang.Runnable>) () -> enter(() -> required("
-                + "java.lang.Runnable.class"), injector);
+        assertInOrder(injector,
+                "public Logger getLogger() {",
+                "throw new InjectionException(\"No Logger was bound, but Bean.logger needs one");
+        assertInOrder(injector,
+                "set(field(Bean.class, \"runnable\"), bean, new Provider<Runnable>() {",
+                "public Runnable get() {",
+                "return getRunnable();",
+                "});");
+        assertInOrder(injector,
+                "public Runnable getRunnable() {",
+                "throw new InjectionException(\"No Runnable was bound, but Bean.runnable needs one");
+    }
+
+    @Test
+    void typesSharingSimpleNamesStayQualifiedAndGetQualifiedFactoryNames() throws IOException {
+        Compilation.Result result = Compilation.withProcessor(workDir, Map.of(
+                "billing.Config", """
+                        package billing;
+                        @jakarta.inject.Singleton
+                        public class Config {}
+                        """,
+                "shipping.Config", """
+                        package shipping;
+                        @jakarta.inject.Singleton
+                        public class Config {}
+                        """,
+                "app.Service", """
+                        package app;
+                        @jakarta.ejb.Stateless
+                        public class Service {
+                            @jakarta.inject.Inject public billing.Config billing;
+                            @jakarta.inject.Inject public shipping.Config shipping;
+                            @jakarta.inject.Inject public java.lang.Thread thread;
+                        }
+                        """,
+                "app.Thread", """
+                        package app;
+                        @jakarta.inject.Singleton
+                        public class Thread {}
+                        """));
+
+        assertTrue(result.success(), result.diagnostics().toString());
+        String injector = result.generatedInjector();
+        assertFalse(injector.contains("import billing.Config;"), injector);
+        assertFalse(injector.contains("import shipping.Config;"), injector);
+        assertTrue(injector.contains("service.billing = getBillingConfig();"), injector);
+        assertTrue(injector.contains("service.shipping = getShippingConfig();"), injector);
+        assertFalse(injector.contains("import app.Thread;"), "must not shadow java.lang.Thread");
+        assertTrue(injector.contains("public app.Thread getThread() {"), injector);
+        assertTrue(injector.contains("service.thread = getThread_2();"), "the java.lang.Thread injection point");
     }
 
     @Test
@@ -317,12 +555,12 @@ class InjectorProcessorTest {
         assertEquals(2, warnings.size(), warnings.toString());
         String injector = stage2.generatedInjector();
         assertNotNull(injector);
-        assertTrue(injector.contains("BINDINGS.put(lib.Repo.class, lib.JpaRepo.class);"), injector);
+        assertTrue(injector.contains("return repo != null ? repo : getJpaRepo();"), injector);
         assertTrue(injector.contains("lib.nested.Deep"), injector);
         assertTrue(injector.contains("lib.nested.deeper.Deepest"), injector);
         assertTrue(injector.contains("lib.Outer.Nested"),
                 "nested static bean classes are found through their outer class");
-        assertEquals(1, countOccurrences(injector, "private lib.Outer.Nested bean_"), "and only once");
+        assertEquals(1, countOccurrences(injector, "public Outer.Nested getNested() {"), "and only once");
 
         // Parent is the platform loader so that the fixture Injector on the test class path is not picked up instead.
         try (URLClassLoader loader = new URLClassLoader(
@@ -469,12 +707,15 @@ class InjectorProcessorTest {
 
         assertTrue(result.success(), result.diagnostics().toString());
         String injector = result.generatedInjector();
-        assertTrue(injector.contains("instance.publicField = bean_app_Dep();"), injector);
-        assertTrue(injector.contains("set(FIELD_app_Bean_privateField, instance, bean_app_Dep());"), injector);
-        assertTrue(injector.contains("instance.publicSetter((app.Dep) bean_app_Dep());"), injector);
-        assertTrue(injector.contains("invoke(METHOD_app_Bean_packageSetter, instance, bean_app_Dep());"), injector);
-        assertTrue(injector.contains("postConstructQueue.add(() -> instance.init());"), injector);
-        assertFalse(injector.contains("import "), "generated code is fully qualified");
+        assertTrue(injector.contains("bean.publicField = getDep();"), injector);
+        assertTrue(injector.contains("set(field(Bean.class, \"privateField\"), bean, getDep());"), injector);
+        assertTrue(injector.contains("bean.publicSetter(getDep());"), injector);
+        assertTrue(injector.contains("invoke(method(Bean.class, \"packageSetter\", Dep.class), bean, getDep());"),
+                injector);
+        assertTrue(injector.contains("bean.init();"), injector);
+        assertFalse(injector.contains("->"), "generated code uses no lambdas");
+        assertFalse(injector.contains("::"), "generated code uses no method references");
+        assertFalse(injector.contains("java.util.Map<"), "JDK types are imported like everything else");
     }
 
     @Test
@@ -483,7 +724,7 @@ class InjectorProcessorTest {
         // anything newer than Java 8. Java 11 is the oldest level a Jakarta EE 10 project can be compiled at.
         Compilation.Result release11 = compileBeanAtRelease("11");
         assertTrue(release11.success(), release11.diagnostics().toString());
-        assertTrue(release11.generatedInjector().contains("@javax.annotation.processing.Generated("),
+        assertTrue(release11.generatedInjector().contains("import javax.annotation.processing.Generated;"),
                 release11.generatedInjector());
 
         // Java 8 has no javax.annotation.processing.Generated yet, so the pre-9 annotation is used instead.
@@ -491,7 +732,8 @@ class InjectorProcessorTest {
                 "this javac no longer compiles for Java 8");
         Compilation.Result release8 = compileBeanAtRelease("8");
         assertTrue(release8.success(), release8.diagnostics().toString());
-        assertTrue(release8.generatedInjector().contains("@javax.annotation.Generated("), release8.generatedInjector());
+        assertTrue(release8.generatedInjector().contains("import javax.annotation.Generated;"),
+                release8.generatedInjector());
     }
 
     /** Compiles a bean with every kind of injection point, and the injector generated for it, at the given release. */

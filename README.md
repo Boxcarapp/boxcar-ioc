@@ -53,7 +53,7 @@ Two interchangeable implementations of the same class exist; pick one per projec
 
 | Module | `com.boxcar.Injector` is... | Best when |
 | --- | --- | --- |
-| [`boxcar-ioc-processor`](boxcar-ioc-processor/README.md) | generated at compile time by an annotation processor that knows every bean | you want interfaces and generic types resolved to their implementations automatically and bean definitions validated at build time |
+| [`boxcar-ioc-processor`](boxcar-ioc-processor/README.md) | generated at compile time by an annotation processor that knows every bean, with a typed getter per bean (`getOrderService()`) | you want interfaces and generic types resolved to their implementations automatically, bean definitions validated at build time, and wiring you can read |
 | [`boxcar-ioc-reflection`](boxcar-ioc-reflection/README.md) | a runtime library that introspects only the classes it is asked for and the ones they reference | you want no build integration; interfaces are bound to implementations by the test |
 | [`boxcar-ioc-tck`](boxcar-ioc-tck/README.md) | (fixtures and an abstract test suite) | verifying that both behave the same |
 
@@ -74,9 +74,11 @@ public <T> Injector bind(Class<T> type, Class<? extends T> implementation);
 public static final class InjectionException extends RuntimeException;
 ```
 
-and share the same semantics: one instance per bean class per `Injector`, Jakarta Inject ordering
-and overriding rules, `Provider<T>`, lazy resolution of dependency cycles through field and method
-injection, `@PostConstruct` after the whole graph is wired. A dependency that cannot be satisfied is
+and share the same semantics — the generated one additionally offers a typed getter per bean, at
+the price of source compatibility with the reflection one. One instance per bean class per
+`Injector`, Jakarta Inject ordering and overriding rules, `Provider<T>`, dependency cycles closed
+through field and method injection after the instances exist, `@PostConstruct` once a bean's
+dependencies (in a cycle: the whole cycle) are wired. A dependency that cannot be satisfied is
 reported by `InjectionException` naming the injection point and the `bind` call to make; an
 unchecked exception thrown by bean code (a constructor, an `@Inject` method or a `@PostConstruct`
 callback) propagates unwrapped. Either way the failed resolution is rolled back, so a test can bind

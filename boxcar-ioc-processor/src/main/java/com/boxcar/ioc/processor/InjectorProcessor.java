@@ -26,7 +26,6 @@ package com.boxcar.ioc.processor;
  * #L%
  */
 
-import com.boxcar.ioc.processor.BeanModel.Dependency;
 import java.io.File;
 import java.io.IOException;
 import java.io.Writer;
@@ -142,7 +141,7 @@ public final class InjectorProcessor extends AbstractProcessor {
             // The latter only happens when dependency types never resolved, which javac reports on its own.
             return false;
         }
-        if (beanClasses.values().stream().anyMatch(scanner::hasUnresolvedTypes)) {
+        if (anyHasUnresolvedTypes()) {
             // Some injection point mentions a type that does not exist yet; another processor may generate
             // it, so wait for the next round.
             return false;
@@ -152,13 +151,24 @@ public final class InjectorProcessor extends AbstractProcessor {
         return false;
     }
 
+    private boolean anyHasUnresolvedTypes() {
+        for (TypeElement type : beanClasses.values()) {
+            if (scanner.hasUnresolvedTypes(type)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void scanConfiguredPackages() {
         String option = processingEnv.getOptions().get(PACKAGES_OPTION);
         if (option == null || option.isBlank()) {
             return;
         }
-        ClassPathScanner scanner = new ClassPathScanner(getClass().getClassLoader(), configuredClassPath(),
-                message -> diagnostics.warning(message + " (-A" + CLASSPATH_OPTION + ")"));
+        ClassPathScanner scanner = new ClassPathScanner(getClass().getClassLoader(), configuredClassPath());
+        for (String warning : scanner.warnings()) {
+            diagnostics.warning(warning + " (-A" + CLASSPATH_OPTION + ")");
+        }
         for (String entry : option.split(",")) {
             String prefix = entry.strip();
             if (prefix.isEmpty()) {
@@ -222,18 +232,20 @@ public final class InjectorProcessor extends AbstractProcessor {
 
     private static List<Element> toList(Iterable<? extends Element> elements) {
         List<Element> list = new ArrayList<>();
-        elements.forEach(list::add);
+        for (Element element : elements) {
+            list.add(element);
+        }
         return list;
     }
 
     private void generate() {
         List<BeanModel> beans = new ArrayList<>();
-        beanClasses.forEach((qualifiedName, type) -> {
-            BeanModel bean = scanner.scan(type, beanAnnotations.get(qualifiedName));
+        for (Map.Entry<String, TypeElement> entry : beanClasses.entrySet()) {
+            BeanModel bean = scanner.scan(entry.getValue(), beanAnnotations.get(entry.getKey()));
             if (bean != null) {
                 beans.add(bean);
             }
-        });
+        }
 
         DependencyResolver resolver = new DependencyResolver(processingEnv.getTypeUtils(), names, beans);
         resolver.resolveAll();
@@ -247,7 +259,10 @@ public final class InjectorProcessor extends AbstractProcessor {
 
         Filer filer = processingEnv.getFiler();
         try {
-            Element[] originating = beans.stream().map(bean -> (Element) bean.type).toArray(Element[]::new);
+            Element[] originating = new Element[beans.size()];
+            for (int i = 0; i < beans.size(); i++) {
+                originating[i] = beans.get(i).type;
+            }
             JavaFileObject file = filer.createSourceFile(InjectorGenerator.QUALIFIED_NAME, originating);
             try (Writer writer = file.openWriter()) {
                 writer.write(source);
@@ -265,32 +280,18 @@ public final class InjectorProcessor extends AbstractProcessor {
      * every other cycle is closed after construction through field or method injection.
      */
     private void reportCycles(List<BeanModel> beans) {
-        Map<BeanModel, List<BeanModel>> constructorEdges = new LinkedHashMap<>();
-        Map<BeanModel, List<BeanModel>> allEdges = new LinkedHashMap<>();
-        for (BeanModel bean : beans) {
-            constructorEdges.put(bean, targets(bean.constructor.parameters()));
-            allEdges.put(bean, targets(bean.dependencies()));
-        }
-        List<List<BeanModel>> constructorCycles = CycleDetector.findCycles(constructorEdges);
+        List<List<BeanModel>> constructorCycles = CycleDetector.findCycles(CycleDetector.edges(beans, true));
         for (List<BeanModel> cycle : constructorCycles) {
             diagnostics.error(cycle.get(0).type, "Dependency cycle through constructor injection cannot be satisfied: "
                     + CycleDetector.describe(cycle)
                     + ". Inject one of the dependencies into a field or method, or as a Provider");
         }
-        for (List<BeanModel> cycle : CycleDetector.findCycles(allEdges)) {
+        for (List<BeanModel> cycle : CycleDetector.findCycles(CycleDetector.edges(beans, false))) {
             if (!constructorCycles.contains(cycle)) {
                 diagnostics.note(cycle.get(0).type, "Dependency cycle " + CycleDetector.describe(cycle)
-                        + " is resolved lazily: the instances are created first and the cycle is closed by field/method"
-                        + " injection");
+                        + " is closed after construction: the instances are created first and then injected into"
+                        + " each other");
             }
         }
-    }
-
-    /** Beans that the given dependencies are resolved to; Provider dependencies are lazy and create no edge. */
-    private static List<BeanModel> targets(List<Dependency> dependencies) {
-        return dependencies.stream()
-                .filter(dependency -> dependency.resolved != null && !dependency.provider)
-                .map(dependency -> dependency.resolved)
-                .toList();
     }
 }

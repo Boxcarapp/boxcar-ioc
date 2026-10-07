@@ -27,8 +27,10 @@ package com.boxcar.ioc;
  */
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -37,6 +39,10 @@ import com.boxcar.Injector;
 import com.boxcar.ioc.fixtures.access.HiddenConstructor;
 import com.boxcar.ioc.fixtures.access.InternalImpl;
 import com.boxcar.ioc.fixtures.access.Visible;
+import com.boxcar.ioc.fixtures.cycles.Alpha;
+import com.boxcar.ioc.fixtures.cycles.Beta;
+import com.boxcar.ioc.fixtures.cycles.Delta;
+import com.boxcar.ioc.fixtures.cycles.Gamma;
 import com.boxcar.ioc.fixtures.inheritance.AbstractService;
 import com.boxcar.ioc.fixtures.inheritance.ProductRepository;
 import com.boxcar.ioc.fixtures.inheritance.ProductService;
@@ -132,5 +138,48 @@ class GeneratedInjectorTest {
         assertSame(declining, orders.paymentGateway());
         assertInstanceOf(InMemoryOrderRepository.class, orders.repository(),
                 "defaults that are not overridden still apply");
+    }
+
+    @Test
+    void boundMemberOfCycleIsInjectedAsBoundAndLeftAlone() {
+        Beta mock = new Beta();
+        Injector injector = new Injector().bind(Beta.class, mock);
+
+        Alpha alpha = injector.getInstance(Alpha.class);
+
+        assertSame(mock, alpha.beta(), "the bound instance replaces the cycle member");
+        assertNull(mock.alpha(), "a bound instance is never injected");
+        assertFalse(mock.alphaHadBetaAtInit(), "a bound instance gets no @PostConstruct");
+        assertTrue(alpha.betaWiredAtInit());
+        assertSame(mock, injector.getInstance(Beta.class));
+    }
+
+    @Test
+    void cycleCanBeEnteredFromEitherMemberOnlyOnce() {
+        Injector injector = new Injector();
+
+        Delta delta = injector.getInstance(Delta.class);
+        Gamma gamma = injector.getInstance(Gamma.class);
+
+        assertSame(gamma, delta.gamma());
+        assertSame(delta, gamma.delta());
+    }
+
+    @Test
+    void typedGettersAreTheSameEntryPointAsGetInstance() {
+        Injector injector = new Injector().bind(OrderRepository.class, InMemoryOrderRepository.class);
+
+        // Fails on the unbound PaymentGateway and rolls back, just like getInstance.
+        Injector.InjectionException failure = assertThrows(Injector.InjectionException.class,
+                () -> injector.getOrderService());
+        assertTrue(failure.getMessage().contains("OrderService.paymentGateway"), failure.getMessage());
+        injector.bind(OrderRepository.class, new InMemoryOrderRepository());
+        injector.bind(PaymentGateway.class, amount -> true);
+
+        OrderService orders = injector.getOrderService();
+
+        assertSame(orders, injector.getInstance(OrderService.class));
+        assertSame(injector.getOrderRepository(), orders.repository(), "the resolver of the interface is public too");
+        assertSame(injector.getConfig(), injector.getTaxCalculator().config());
     }
 }
