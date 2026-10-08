@@ -144,7 +144,7 @@ class InjectorProcessorTest {
         // Members: both constructed and stored, then injected into each other, then the callbacks: B first,
         // because A depends on it.
         assertInOrder(injector,
-                "private void createAB() {",
+                "private void createCycle() {",
                 "A a = existing(A.class);",
                 "boolean newA = a == null;",
                 "a = new A();",
@@ -164,7 +164,7 @@ class InjectorProcessorTest {
         assertInOrder(injector,
                 "public A getA() {",
                 "A a = existing(A.class);",
-                "createAB();",
+                "createCycle();",
                 "a = (A) instances.get(A.class);");
         // A bean outside the cycle simply calls the factory of what it depends on.
         assertTrue(injector.contains("c = new C(getA());"), injector);
@@ -190,10 +190,49 @@ class InjectorProcessorTest {
 
         assertTrue(result.success(), result.diagnostics().toString());
         assertInOrder(result.generatedInjector(),
-                "private void createDeltaGamma() {",
+                "private void createCycle() {",
                 "delta = new Delta();",
                 "gamma = new Gamma(delta);",
                 "delta.gamma = gamma;");
+    }
+
+    @Test
+    void cycleGroupsAreNumberedWhenThereAreSeveral() throws IOException {
+        Compilation.Result result = Compilation.withProcessor(workDir, Map.of(
+                "app.A", ring("A", "B"), "app.B", ring("B", "C"), "app.C", ring("C", "A"),
+                "app.P", ring("P", "Q"), "app.Q", ring("Q", "R"), "app.R", ring("R", "S"), "app.S", ring("S", "P")));
+
+        assertTrue(result.success(), result.diagnostics().toString());
+        String injector = result.generatedInjector();
+        // The method's Javadoc names the members; a getter names the others only in a small group.
+        assertInOrder(injector,
+                "/**",
+                " * Creates {@link A}, {@link B} and {@link C}, which depend on each other:",
+                "private void createCycle1() {");
+        assertInOrder(injector,
+                "/** Created together with {@link B} and {@link C}, see {@link #createCycle1}. */",
+                "public A getA() {",
+                "createCycle1();");
+        assertInOrder(injector,
+                " * Creates {@link P}, {@link Q}, {@link R} and {@link S}, which depend on each other:",
+                "private void createCycle2() {");
+        assertInOrder(injector,
+                "/** Created together with 3 other beans, see {@link #createCycle2}. */",
+                "public P getP() {",
+                "createCycle2();");
+        assertFalse(injector.contains("createCycle()"), injector);
+        assertFalse(injector.contains("{@link\n"), "an inline tag is never split over lines:\n" + injector);
+    }
+
+    /** A bean that closes a cycle by having the next bean of a ring injected into a field. */
+    private static String ring(String name, String next) {
+        return """
+                package app;
+                @jakarta.ejb.Stateless
+                public class %s {
+                    @jakarta.inject.Inject public %s %s;
+                }
+                """.formatted(name, next, next.toLowerCase());
     }
 
     @Test
@@ -231,7 +270,7 @@ class InjectorProcessorTest {
                 "instances.put(Service.class, service);",
                 "service.self = getConfig();",
                 "return service;");
-        assertFalse(injector.contains("create" + "Config"), "no group method for acyclic beans");
+        assertFalse(injector.contains("createCycle"), "no group method for acyclic beans");
     }
 
     @Test

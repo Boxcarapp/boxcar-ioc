@@ -79,6 +79,16 @@ final class Imports {
         return reference.toString();
     }
 
+    /** The length of the text once its markers are resolved, taking each class to be rendered by simple name. */
+    static int renderedLength(String text) {
+        int length = text.length();
+        Matcher matcher = MARKER.matcher(text);
+        while (matcher.find()) {
+            length -= matcher.group().length() - simpleName(matcher.group(1)).length();
+        }
+        return length;
+    }
+
     /**
      * Resolves the markers in {@code source} and inserts the import block after the package declaration.
      *

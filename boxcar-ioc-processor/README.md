@@ -239,10 +239,11 @@ Beans that depend on each other are created by one method for the whole group. E
 constructed first, in an order that satisfies the constructor dependencies among them, and only then
 are they injected into each other, so the cycle is closed by field and method injection once all of
 them exist. Their callbacks run after all of the injection, dependencies first as far as the cycle
-allows. Each member's getter delegates to that method:
+allows. Each member's getter delegates to that method, `createCycle()` — or `createCycle1()`,
+`createCycle2()`… when there are several such groups — whose Javadoc names the members:
 
 ```java
-private void createDeltaGamma() {
+private void createCycle() {
     Set<Class<?>> before = new HashSet<>(instances.keySet());
     try {
         Delta delta = existing(Delta.class);

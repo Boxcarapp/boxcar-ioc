@@ -87,6 +87,12 @@ final class InjectorGenerator {
     private static final Set<String> METHODS = Set.of("getInstance", "bind", "existing", "loadClass", "field",
             "method", "constructor", "set", "invoke", "newInstance", "unwrap", "get", "toString", "hashCode", "equals",
             "getClass", "clone", "finalize", "wait", "notify", "notifyAll");
+    /**
+     * The most members a group of mutually dependent beans may have for a member's getter to name the
+     * others in its Javadoc; the getters of a larger group only count them, as the group's method lists
+     * them all.
+     */
+    private static final int NAMED_GROUP_MEMBERS = 3;
 
     private final Types types;
     private final Elements elements;
@@ -125,9 +131,11 @@ final class InjectorGenerator {
         nameGetters();
         Map<BeanModel, List<BeanModel>> edges = CycleDetector.edges(this.beans, false);
         Map<BeanModel, List<BeanModel>> constructorEdges = CycleDetector.edges(this.beans, true);
-        for (List<BeanModel> component : CycleDetector.components(edges)) {
-            CycleGroup group = new CycleGroup(component, edges, constructorEdges);
-            for (BeanModel member : component) {
+        List<List<BeanModel>> components = CycleDetector.components(edges);
+        for (int i = 0; i < components.size(); i++) {
+            String name = components.size() == 1 ? "createCycle" : "createCycle" + (i + 1);
+            CycleGroup group = new CycleGroup(uniqueName(name), components.get(i), edges, constructorEdges);
+            for (BeanModel member : components.get(i)) {
                 groups.put(member, group);
             }
         }
@@ -470,8 +478,7 @@ final class InjectorGenerator {
         String local = scope.declare(localName(bean.type.getSimpleName().toString()));
 
         if (group != null) {
-            out.line("/** Created together with " + group.describeOthers(bean) + ", see {@link #" + group.name
-                    + "}. */");
+            out.javadoc("Created together with " + group.describeOthers(bean) + ", see {@link #" + group.name + "}.");
         }
         out.open("public " + type + " " + getterNames.get(bean) + "() {");
         out.line(type + " " + local + " = existing(" + literal + ");");
@@ -530,13 +537,9 @@ final class InjectorGenerator {
         for (Map.Entry<BeanModel, String> local : localNames(group.members).entrySet()) {
             scope.locals.put(local.getKey(), scope.declare(local.getValue()));
         }
-        out.line("/**");
-        out.line(" * Creates " + group.describe() + ", which depend on each other: all of them are constructed before"
-                + " any is");
-        out.line(" * injected, and all are injected before their @PostConstruct callbacks run. A member whose class is"
-                + " bound");
-        out.line(" * is used as bound.");
-        out.line(" */");
+        out.javadoc("Creates " + group.describe() + ", which depend on each other: all of them are constructed"
+                + " before any is injected, and all are injected before their @PostConstruct callbacks run. A member"
+                + " whose class is bound is used as bound.");
         out.open("private void " + group.name + "() {");
         writeSnapshot(out);
         out.open("try {");
@@ -718,15 +721,15 @@ final class InjectorGenerator {
                 : "value"));
         String displayName = DependencyResolver.simpleNames(names.describe(resolver.type));
         if (resolver.bean != null) {
-            out.line("/** {@code " + displayName + "} is implemented by {@link " + typeName(resolver.bean) + "}"
-                    + (accessible ? "" : "; the type itself is not visible from here") + ". */");
+            out.javadoc("{@code " + displayName + "} is implemented by {@link " + typeName(resolver.bean) + "}"
+                    + (accessible ? "" : "; the type itself is not visible from here") + ".");
             out.open("public " + type + " " + resolver.name + "() {");
             out.line(type + " " + local + " = existing(" + literal + ");");
             out.line("return " + local + " != null ? " + local + " : " + getterNames.get(resolver.bean) + "();");
             out.close();
             return;
         }
-        out.line("/** {@code " + displayName + "} has to be bound by the test: " + resolver.reason + ". */");
+        out.javadoc("{@code " + displayName + "} has to be bound by the test: " + resolver.reason + ".");
         out.open("public " + type + " " + resolver.name + "() {");
         out.line(type + " " + local + " = existing(" + literal + ");");
         out.open("if (" + local + " == null) {");
@@ -982,7 +985,10 @@ final class InjectorGenerator {
         }
     }
 
-    /** Beans that depend on each other and are therefore created together, see {@link #writeGroup}. */
+    /**
+     * Beans that depend on each other and are therefore created together, see {@link #writeGroup}. The
+     * method is {@code createCycle}, numbered from 1 in bean order when there are several groups.
+     */
     private final class CycleGroup {
 
         final String name;
@@ -991,16 +997,12 @@ final class InjectorGenerator {
         /** The members in the order their callbacks run: dependencies first, as far as a cycle allows. */
         final List<BeanModel> callbackOrder;
 
-        CycleGroup(List<BeanModel> component, Map<BeanModel, List<BeanModel>> edges,
+        CycleGroup(String name, List<BeanModel> component, Map<BeanModel, List<BeanModel>> edges,
                 Map<BeanModel, List<BeanModel>> constructorEdges) {
+            this.name = name;
             this.members = creationOrder(component, constructorEdges);
             this.callbackOrder = new ArrayList<>();
             visitDependenciesFirst(members.get(0), edges, new HashSet<>(), callbackOrder);
-            StringBuilder name = new StringBuilder("create");
-            for (BeanModel member : members) {
-                name.append(member.type.getSimpleName());
-            }
-            this.name = uniqueName(name.toString());
         }
 
         /** The members as {@code {@link A}, {@link B} and {@link C}}. */
@@ -1019,8 +1021,14 @@ final class InjectorGenerator {
             return description.toString();
         }
 
-        /** The members other than {@code bean}, as {@link #describe()}. */
+        /**
+         * The members other than {@code bean}, as {@link #describe()}; in a group with more than
+         * {@link #NAMED_GROUP_MEMBERS}, just their number, as the group's method lists them all.
+         */
         String describeOthers(BeanModel bean) {
+            if (members.size() > NAMED_GROUP_MEMBERS) {
+                return (members.size() - 1) + " other beans";
+            }
             List<BeanModel> others = new ArrayList<>(members);
             others.remove(bean);
             return describe(others);
